@@ -1,0 +1,7 @@
+customtkinter
+pillow
+pystray
+edge-tts
+google-genai
+google-generativeai
+groq
