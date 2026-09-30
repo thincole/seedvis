@@ -284,7 +284,7 @@ class SeedvisApp(ctk.CTk):
             "seedvis_auto_refill_threshold": "100",
             "seedvis_auto_refill_amount": "1000",
             "seedvis_daily_limit_enabled": True,
-            "seedvis_daily_limit": "880",
+            "seedvis_daily_limit": "1760",
             "gemini_keys": [],
             "groq_api_key": ""
         }
@@ -350,7 +350,7 @@ class SeedvisApp(ctk.CTk):
                 "seedvis_auto_refill_threshold": self._seed_auto_refill_threshold.get().strip(),
                 "seedvis_auto_refill_amount": self._seed_auto_refill_amount.get().strip(),
                 "seedvis_daily_limit_enabled": self._seed_daily_limit_enabled.get(),
-                "seedvis_daily_limit": self._seed_daily_limit_entry.get().strip() or "880",
+                "seedvis_daily_limit": self._seed_daily_limit_entry.get().strip() or "1760",
                 "gemini_keys": self.gemini_keys,
                 "groq_api_key": "\n".join(self.groq_keys) if isinstance(self.groq_keys, list) else self.groq_keys,
             })
@@ -739,7 +739,7 @@ class SeedvisApp(ctk.CTk):
                         font=("", 11, "bold"), checkbox_width=18, checkbox_height=18).pack(side="left")
         self._seed_daily_limit_entry = ctk.CTkEntry(daily_row, width=65, font=("", 11))
         self._seed_daily_limit_entry.pack(side="left", padx=4)
-        self._seed_daily_limit_entry.insert(0, str(self.settings.get("seedvis_daily_limit", "880")))
+        self._seed_daily_limit_entry.insert(0, str(self.settings.get("seedvis_daily_limit", "1760")))
         ctk.CTkLabel(daily_row, text="video/ngày (Đủ số lượng hoặc hết credit sẽ tự dừng & trả SP kẹt)",
                      font=("", 11), text_color=T2).pack(side="left", padx=(4, 0))
 
@@ -2042,9 +2042,9 @@ class SeedvisApp(ctk.CTk):
 
             daily_limit_enabled = self._seed_daily_limit_enabled.get()
             try:
-                daily_limit = int(self._seed_daily_limit_entry.get().strip() or "880")
+                daily_limit = int(self._seed_daily_limit_entry.get().strip() or "1760")
             except Exception:
-                daily_limit = 880
+                daily_limit = 1760
 
             def count_today_videos(folder):
                 if not folder or not os.path.exists(folder):
