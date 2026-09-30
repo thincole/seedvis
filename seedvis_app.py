@@ -7,13 +7,16 @@ Tạo video Veo 3.1 Image-to-Video độc lập qua Seedvis Developer API.
 
 import os
 import sys
+import re
 import time
+import datetime
 import json
 import uuid
 import queue
 import shutil
 import random
 import base64
+import ctypes
 import threading
 import collections
 import subprocess
@@ -25,9 +28,35 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # --- Load helper modules from current directory ---
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Bản .exe (PyInstaller): __file__ trỏ vào _internal, phải lấy thư mục chứa .exe mới đúng
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(sys.executable)
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+# --- Chế độ app: mỗi exe build riêng khóa cứng 1 nhà cung cấp video ---
+# Runtime hook của PyInstaller (rthook_mode_seedvis.py / rthook_mode_novagate.py) đặt biến môi trường
+# này trước khi file chạy. Chạy thẳng từ mã nguồn (không đặt biến) thì cho chọn cả 2 như cũ.
+APP_MODE = os.environ.get("SEEDVIS_APP_MODE", "both").strip().lower()
+if APP_MODE not in ("seedvis", "nova", "both"):
+    APP_MODE = "both"
+APP_NAME = "NovaGate" if APP_MODE == "nova" else "Seedvis"
+PROVIDER_SEEDVIS = "Seedvis (Veo 3.1)"
+PROVIDER_NOVA = "NovaGateway (Flow Veo)"
+APP_ICON_FILE = "novagate_icon.ico" if APP_MODE == "nova" else "seedvis_icon.ico"
+APP_LOGO_FILE = "novagate_logo.png" if APP_MODE == "nova" else "seedvis_logo.png"
+
+
+def asset_path(name):
+    """Tìm file ảnh: bản exe nằm trong _internal (sys._MEIPASS), chạy mã nguồn thì nằm cạnh file .py."""
+    for base in (getattr(sys, "_MEIPASS", None), HERE):
+        if base:
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                return p
+    return None
 
 try:
     import shopeevideo as SV
@@ -52,14 +81,118 @@ RD = "#d93025"
 # --- Seedvis Constants ---
 SEEDVIS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SEEDVIS_PACKAGE_CONCURRENT = 32
+
+# Sản phẩm có nhân vật bản quyền thường bị Google hủy job (not_found) → bỏ qua ngay từ đầu.
+# Dùng ranh giới từ (\b) để không chặn nhầm, ví dụ "Frozen Meat" không bị chặn.
+BLOCKED_IP_KEYWORDS = [
+    "spider-man", "spiderman", "spider man", "marvel", "avengers", "iron man", "captain america",
+    "hulk", "thor", "batman", "superman", "disney", "pixar", "elsa", "hello kitty", "sanrio",
+    "kuromi", "cinnamoroll", "my melody", "mickey mouse", "minnie mouse", "pokemon", "pikachu",
+    "sponge bob", "spongebob", "doraemon", "naruto", "one piece", "harry potter",
+]
+BLOCKED_IP_RE = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in BLOCKED_IP_KEYWORDS) + r")\b", re.IGNORECASE)
+
 SETTINGS_FILE = os.path.join(HERE, "seedvis_settings.json")
 LOG_FILE = os.path.join(HERE, "log.txt")
+# Chạy 24/7 nhiều ngày sẽ làm log.txt phình to không giới hạn → cắt bớt khi vượt ngưỡng, chỉ giữ phần gần nhất
+LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_TRIM_KEEP_BYTES = 5 * 1024 * 1024
+
+
+def parse_count(v):
+    """Số đếm nguyên (lượt bán...). Chịu được số JSON gốc lẫn chuỗi có dấu phân cách hàng nghìn
+    kiểu VN ("1.500" và "1,000" đều hiểu là 1500). Không dùng cho trường có phần thập phân thật."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(re.sub(r'\D', '', str(v)) or "0")
+    except Exception:
+        return 0
+
+
+def parse_price(v, default=0.0):
+    """Tiền về float. Bỏ dấu phẩy ngăn hàng nghìn, GIỮ dấu chấm vì giá có thể có phần thập phân thật."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        s = str(v).replace(",", "").strip()
+        return float(s) if s else default
+    except Exception:
+        return default
+
+
+def decode_api_error(err_body):
+    """Đọc JSON lỗi của API → (message đọc được, tập tên field lỗi, mã type).
+    Seedvis trả message dạng \\uXXXX nên phải json.loads mới so khớp được từ khóa tiếng Việt."""
+    msg, fields, etype = "", set(), ""
+    try:
+        data = json.loads(err_body)
+        if isinstance(data, dict):
+            m = data.get("message")
+            if isinstance(m, str):
+                msg = m
+            err = data.get("error")
+            if isinstance(err, dict):
+                msg = msg or str(err.get("message", ""))
+                etype = str(err.get("type", "") or err.get("code", ""))
+            if isinstance(data.get("errors"), dict):
+                fields = set(data["errors"].keys())
+    except Exception:
+        msg = err_body or ""
+    return msg, fields, etype
+
+
+# Lỗi "đầy slot"/quá tải TẠM THỜI → chờ rồi thử lại. TUYỆT ĐỐI không coi là vi phạm hay hết tiền.
+#   Seedvis 422: "Đã đạt giới hạn: tối đa 10 lượt đồng thời + 20 lượt chờ"
+#   Nova 503:    "Hệ thống đang xử lý lượng lớn yêu cầu cùng lúc... (Không mất Credits)"
+CAPACITY_KEYWORDS = ("giới hạn", "đồng thời", "lượt chờ", "thử lại sau", "lượng lớn yêu cầu",
+                     "quá tải", "concurrent", "queue full", "too many", "try again")
+POLICY_KEYWORDS = ("policy", "violation", "content filter", "safety", "nsfw", "vi phạm", "chính sách", "nhạy cảm")
+# Hết tiền thật: chỉ tin mã 402 hoặc type rõ ràng / câu "không đủ". KHÔNG dò chữ "credit" chung chung,
+# vì thông báo quá tải của Nova có câu "(Không mất Credits)" → từng bị hiểu nhầm thành hết tiền và DỪNG cả hàng đợi.
+NO_CREDIT_TYPES = ("insufficient_balance", "insufficient_credit", "payment_required")
+NO_CREDIT_KEYWORDS = ("không đủ", "insufficient", "hết credit", "hết số dư", "nạp thêm")
+
+
+def is_capacity_full(code, msg, fields):
+    if code not in (422, 429, 503):
+        return False
+    return "quantity" in fields or any(k in msg.lower() for k in CAPACITY_KEYWORDS)
+
+
+def is_policy_violation(msg):
+    return any(k in msg.lower() for k in POLICY_KEYWORDS)
+
+
+def is_no_credit(code, msg, etype):
+    if str(etype).lower() in NO_CREDIT_TYPES:
+        return True
+    if code == 402:
+        return True
+    return any(k in msg.lower() for k in NO_CREDIT_KEYWORDS)
+
+
+# Mã lỗi job NovaGateway mang tính tạm thời (upstream Google Flow quá tải/chậm; Nova tự hoàn credit)
+NOVA_TRANSIENT_CODES = {"generation_failed", "upstream_timeout", "upstream_submission_unknown",
+                        "upstream_error", "rate_limited", "server_busy", "overloaded"}
+NOVA_TRANSIENT_HINTS = ("lượng lớn yêu cầu", "thử lại", "quá tải", "tạm thời", "hoàn lại credits", "try again", "overloaded")
 
 
 class SeedvisApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Thin Aptm — Seedvis Veo 3.1 Video Generator")
+        self.title("Thin Aptm — NovaGate Flow Veo Video Generator" if APP_MODE == "nova"
+                   else "Thin Aptm — Seedvis Veo 3.1 Video Generator")
+        _icon = asset_path(APP_ICON_FILE)
+        if _icon:
+            try:
+                self.iconbitmap(_icon)
+            except Exception:
+                pass
         self.geometry("1260x860")
         self.minsize(1050, 720)
         ctk.set_appearance_mode("light")
@@ -82,23 +215,31 @@ class SeedvisApp(ctk.CTk):
         # State variables
         self._seed_claimed_products = []
         self._seed_running = False
-        self._seed_stop_flag = False
+        self._seed_stop_flag = False    # Dừng lần 1: không gửi job mới, chờ job đang render xong
+        self._seed_force_stop = False   # Dừng lần 2 / thoát: bỏ ngay cả job đang render
+        self._seed_inflight = 0         # số job đã gửi (đã trừ phí) đang chờ kết quả
+        self._seed_inflight_lock = threading.Lock()
         self._seed_video_done_count = 0
         self._seed_completion_times = collections.deque()
         self._seed_run_started_at = time.time()
-        # Xoa trang file log.txt khi khoi dong
-        with open("log.txt", "w", encoding="utf-8") as f:
-            f.write(f"--- PHIEN LAM VIEC MOI SEEDVIS ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
+        try:
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(f"--- PHIEN LAM VIEC MOI {APP_NAME.upper()} ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
+        except Exception:
+            pass
 
         self._seed_log_buffer = []
         self._seed_log_flush_scheduled = False
 
         self._ui_queue = queue.Queue()
         self._poll_ui_queue()
+        self._sweep_temp_render_on_startup()
         self._start_temp_cleaner()
 
         import multiprocessing
-        self._ffmpeg_sem = threading.Semaphore(max(2, (multiprocessing.cpu_count() or 4) // 2))
+        # Mỗi FFmpeg dùng 2 luồng → chỉ cho chạy đồng thời ~1/2 số nhân CPU để máy còn dư sức.
+        # Trần 4 tiến trình: ghép 12s chỉ mất vài giây/video, nhiều hơn không nhanh hơn mà chỉ tranh CPU.
+        self._ffmpeg_sem = threading.Semaphore(max(1, min(4, (multiprocessing.cpu_count() or 4) // 4)))
 
         self._build_ui()
         self._seed_on_ghep_anh_toggle()
@@ -109,7 +250,7 @@ class SeedvisApp(ctk.CTk):
         default_settings = {
             "sv_server_url": "http://100.79.170.67:3000",
             "sv_api_key": "",
-            "sv_client_id": "client_seedvis",
+            "sv_client_id": "client_novagate" if APP_MODE == "nova" else "client_seedvis",
             "seedvis_api_key": "",
             "seedvis_model": "Veo-3.1",
             "seedvis_duration": "8s",
@@ -130,6 +271,20 @@ class SeedvisApp(ctk.CTk):
             "seedvis_market": "PH",
             "seedvis_min_item_id": "40000000000",
             "seedvis_min_commission": "1",
+            "seedvis_min_sold": "0",
+            "seedvis_min_price": "0",
+            "seedvis_max_price": "",
+            "seedvis_video_provider": PROVIDER_SEEDVIS,
+            "novagate_api_key": "",
+            "novagate_model": "google/flow-veo",
+            "novagate_resolution": "480p",
+            "novagate_duration": "6",
+            "novagate_slots": "5",
+            "seedvis_auto_refill": False,
+            "seedvis_auto_refill_threshold": "100",
+            "seedvis_auto_refill_amount": "1000",
+            "seedvis_daily_limit_enabled": True,
+            "seedvis_daily_limit": "880",
             "gemini_keys": [],
             "groq_api_key": ""
         }
@@ -162,7 +317,7 @@ class SeedvisApp(ctk.CTk):
                 "sv_server_url": self._seed_url.get().strip(),
                 "sv_api_key": self._seed_apikey.get().strip(),
                 "sv_client_id": self._seed_client_entry.get().strip(),
-                "seedvis_api_key": self._seed_apikey_input.get().strip(),
+                "seedvis_api_key": self._seed_apikey_input.get("1.0", "end").strip(),
                 "seedvis_model": self._seed_model.get(),
                 "seedvis_duration": self._seed_duration.get(),
                 "seedvis_upscale": self._seed_upscale.get(),
@@ -182,6 +337,20 @@ class SeedvisApp(ctk.CTk):
                 "seedvis_market": self._seed_market.get(),
                 "seedvis_min_item_id": self._seed_min_item_id.get().strip(),
                 "seedvis_min_commission": self._seed_min_commission.get().strip(),
+                "seedvis_min_sold": self._seed_min_sold.get().strip(),
+                "seedvis_min_price": self._seed_min_price.get().strip(),
+                "seedvis_max_price": self._seed_max_price.get().strip(),
+                "seedvis_video_provider": self._seed_provider.get(),
+                "novagate_api_key": self._nova_apikey_input.get("1.0", "end").strip(),
+                "novagate_model": self._nova_model.get(),
+                "novagate_resolution": self._nova_resolution.get(),
+                "novagate_duration": self._nova_duration.get().strip(),
+                "novagate_slots": self._nova_slots.get().strip(),
+                "seedvis_auto_refill": self._seed_auto_refill.get(),
+                "seedvis_auto_refill_threshold": self._seed_auto_refill_threshold.get().strip(),
+                "seedvis_auto_refill_amount": self._seed_auto_refill_amount.get().strip(),
+                "seedvis_daily_limit_enabled": self._seed_daily_limit_enabled.get(),
+                "seedvis_daily_limit": self._seed_daily_limit_entry.get().strip() or "880",
                 "gemini_keys": self.gemini_keys,
                 "groq_api_key": "\n".join(self.groq_keys) if isinstance(self.groq_keys, list) else self.groq_keys,
             })
@@ -191,31 +360,49 @@ class SeedvisApp(ctk.CTk):
             print(f"Lỗi lưu settings: {e}")
 
 
+    def _sweep_temp_render_on_startup(self):
+        """Dọn sạch toàn bộ temp_render ngay lúc mở app.
+        Tiến trình vừa khởi động nên chắc chắn chưa có file nào đang xử lý dở — an toàn xóa hết.
+        Đây là lưới an toàn cho trường hợp lần trước app bị tắt cứng (Task Manager, crash, mất điện)."""
+        try:
+            temp_dir = os.path.join(HERE, "temp_render")
+            if os.path.exists(temp_dir):
+                count = 0
+                for file in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, file))
+                        count += 1
+                    except Exception:
+                        pass
+                if count > 0:
+                    self._seed_log_msg(f"🧹 [Startup] Đã dọn {count} file rác còn sót từ lần chạy trước trong temp_render.")
+        except Exception:
+            pass
+
     def _start_temp_cleaner(self):
         def _cleaner_loop():
             import time
-            import shutil
+            # Chạy suốt vòng đời app (trước đây thoát luôn sau lần bấm Dừng đầu tiên)
             while True:
                 interval_mins = int(self.settings.get("seedvis_clean_interval", 60))
                 time.sleep(interval_mins * 60)
-                if getattr(self, '_seed_stop_flag', False):
-                    break
-                
+
                 try:
-                    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_render")
+                    temp_dir = os.path.join(HERE, "temp_render")
                     if os.path.exists(temp_dir):
                         count = 0
                         for file in os.listdir(temp_dir):
-                            # Skip recent files (less than 10 mins old) to avoid deleting active processing files!
+                            # Chỉ xóa file cũ hơn 2 giờ: ảnh SP còn cần cho bước ghép outro sau khi
+                            # job render xong, mà job có thể xếp hàng/thử lại tới 30-45 phút.
                             filepath = os.path.join(temp_dir, file)
-                            if time.time() - os.path.getmtime(filepath) > 600:
+                            if time.time() - os.path.getmtime(filepath) > 7200:
                                 try:
                                     os.remove(filepath)
                                     count += 1
                                 except Exception:
                                     pass
                         if count > 0:
-                            self._seed_log_msg(f"  dYZz [Auto-Clean] dA? d?n d?p {count} file rAc trong temp_render.")
+                            self._seed_log_msg(f"  🧹 [Auto-Clean] Đã dọn dẹp {count} file rác trong temp_render.")
                 except Exception:
                     pass
                     
@@ -223,57 +410,37 @@ class SeedvisApp(ctk.CTk):
         threading.Thread(target=_cleaner_loop, daemon=True).start()
 
     def _on_closing(self):
-        self.withdraw()
+        """Bấm nút X thoát hẳn phần mềm (không còn thu gọn xuống khay hệ thống)."""
+        n = getattr(self, "_seed_inflight", 0)
+        if getattr(self, "_seed_running", False) and n > 0:
+            if not messagebox.askyesno(
+                "Còn job đang render",
+                f"Đang có {n} job đã gửi (ĐÃ BỊ TRỪ PHÍ) chưa render xong.\n\n"
+                f"Thoát ngay sẽ bỏ các job này: chúng vẫn chạy trên server, chiếm slot tài khoản, "
+                f"và video sẽ không được tải về.\n\n"
+                f"Nên bấm 'No', rồi bấm ⏹ Dừng để app chờ các job này xong.\n\nVẫn thoát ngay?"):
+                return
+        self._seed_stop_flag = True
+        self._seed_force_stop = True
+        self._save_settings()
         try:
-            import pystray
-            from PIL import Image, ImageDraw
-            
-            def create_image():
-                image = Image.new('RGB', (64, 64), color=(26, 115, 232))
-                draw = ImageDraw.Draw(image)
-                draw.ellipse((16, 16, 48, 48), fill=(255, 255, 255))
-                return image
-
-            def on_show(icon, item):
-                icon.stop()
-                self.after(0, self.deiconify)
-                
-            def on_quit(icon, item):
-                icon.stop()
-                self._seed_stop_flag = True
-                self._save_settings()
-                try:
-                    c_id = self._seed_client_entry.get().strip()
-                    if c_id:
-                        self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": c_id})
-                except Exception:
-                    pass
-                # Dọn dẹp temp_render khi tắt phần mềm theo Rule #8
-                try:
-                    import shutil
-                    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_render")
-                    if os.path.exists(temp_dir):
-                        for file in os.listdir(temp_dir):
-                            try:
-                                os.remove(os.path.join(temp_dir, file))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                self.after(0, self.destroy)
-                
-            menu = pystray.Menu(
-                pystray.MenuItem('Hiển thị cửa sổ', on_show, default=True),
-                pystray.MenuItem('Thoát hoàn toàn', on_quit)
-            )
-            
-            icon = pystray.Icon("Seedvis", create_image(), "Thin Aptm - Seedvis", menu)
-            import threading
-            threading.Thread(target=icon.run, daemon=True).start()
-        except ImportError:
-            self._seed_stop_flag = True
-            self._save_settings()
-            self.destroy()
+            c_id = self._seed_client_entry.get().strip()
+            if c_id:
+                self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": c_id})
+        except Exception:
+            pass
+        # Dọn dẹp temp_render khi tắt phần mềm theo Rule #8
+        try:
+            temp_dir = os.path.join(HERE, "temp_render")
+            if os.path.exists(temp_dir):
+                for file in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, file))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self.destroy()
 
     def _poll_ui_queue(self):
         try:
@@ -299,7 +466,20 @@ class SeedvisApp(ctk.CTk):
         # --- Header ---
         hdr = ctk.CTkFrame(f, fg_color="transparent")
         hdr.pack(fill="x", padx=12, pady=(0, 4))
-        ctk.CTkLabel(hdr, text="🌱 Seedvis — Veo 3.1 Image-to-Video (Độc lập)", font=("", 18, "bold"), text_color=T1).pack(side="left")
+        hdr_text = "🚀 NovaGate — Flow Veo Image-to-Video (Độc lập)" if APP_MODE == "nova" else "🌱 Seedvis — Veo 3.1 Image-to-Video (Độc lập)"
+        _logo = asset_path(APP_LOGO_FILE)
+        if _logo:
+            try:
+                from PIL import Image as _PILImage
+                _img = _PILImage.open(_logo)
+                _h = 44 if APP_MODE == "nova" else 32
+                self._hdr_logo = ctk.CTkImage(light_image=_img, dark_image=_img,
+                                              size=(int(_img.width * _h / _img.height), _h))
+                ctk.CTkLabel(hdr, image=self._hdr_logo, text="").pack(side="left", padx=(0, 10))
+                hdr_text = "NovaGate — Flow Veo Image-to-Video (Độc lập)" if APP_MODE == "nova" else "Veo 3.1 Image-to-Video (Độc lập)"
+            except Exception:
+                pass
+        ctk.CTkLabel(hdr, text=hdr_text, font=("", 18, "bold"), text_color=T1).pack(side="left")
         self._seed_status_lbl = ctk.CTkLabel(hdr, text="Sẵn sàng", font=("", 12), text_color=T2)
         self._seed_status_lbl.pack(side="right")
 
@@ -321,7 +501,7 @@ class SeedvisApp(ctk.CTk):
         ctk.CTkLabel(conn_row, text="Client ID:", font=("", 12)).pack(side="left", padx=(12, 0))
         self._seed_client_entry = ctk.CTkEntry(conn_row, width=160, font=("", 11))
         self._seed_client_entry.pack(side="left", padx=4)
-        self._seed_client_entry.insert(0, self.settings.get("sv_client_id", "client_seedvis"))
+        self._seed_client_entry.insert(0, self.settings.get("sv_client_id", "client_novagate" if APP_MODE == "nova" else "client_seedvis"))
 
         self._seed_cached_url = self._seed_url.get().strip()
         self._seed_cached_apikey = self._seed_apikey.get().strip()
@@ -329,15 +509,35 @@ class SeedvisApp(ctk.CTk):
         # --- Cấu hình Seedvis API ---
         api_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=10)
         api_card.pack(fill="x", padx=12, pady=4)
-        api_row = ctk.CTkFrame(api_card, fg_color="transparent")
-        api_row.pack(fill="x", padx=12, pady=6)
-        ctk.CTkLabel(api_row, text="🔑 Seedvis API Key:", font=("", 12)).pack(side="left")
-        self._seed_apikey_input = ctk.CTkEntry(api_row, width=380, font=("", 11), show="*")
-        self._seed_apikey_input.pack(side="left", padx=4)
-        default_seed_key = self.settings.get("seedvis_api_key", "")
-        self._seed_apikey_input.insert(0, default_seed_key)
+        provider_row = ctk.CTkFrame(api_card, fg_color="transparent")
+        provider_row.pack(fill="x", padx=12, pady=(6, 2))
+        self._seed_provider = ctk.CTkOptionMenu(provider_row, values=[PROVIDER_SEEDVIS, PROVIDER_NOVA],
+                                                width=220, command=lambda _: self._seed_on_provider_toggle())
+        if APP_MODE == "both":
+            ctk.CTkLabel(provider_row, text="🎬 Nhà cung cấp video:", font=("", 12, "bold"), text_color=T1).pack(side="left")
+            self._seed_provider.pack(side="left", padx=4)
+            self._seed_provider.set(self.settings.get("seedvis_video_provider", PROVIDER_SEEDVIS))
+        else:
+            # Exe riêng: khóa cứng nhà cung cấp, không hiện ô chọn (widget vẫn giữ để code đọc .get())
+            self._seed_provider.set(PROVIDER_NOVA if APP_MODE == "nova" else PROVIDER_SEEDVIS)
 
-        ctk.CTkLabel(api_row, text="Model:", font=("", 12)).pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(provider_row, text="Luồng:", font=("", 12)).pack(side="left", padx=(16 if APP_MODE == "both" else 0, 0))
+        self._seed_threads = ctk.CTkEntry(provider_row, width=50, font=("", 11))
+        self._seed_threads.pack(side="left", padx=4)
+        self._seed_threads.insert(0, self.settings.get("seedvis_threads", "12"))
+
+        # -- Khối cấu hình riêng cho Seedvis --
+        self._seedvis_block = ctk.CTkFrame(api_card, fg_color="transparent")
+        key_row = ctk.CTkFrame(self._seedvis_block, fg_color="transparent")
+        key_row.pack(fill="x", padx=0, pady=(2, 2))
+        ctk.CTkLabel(key_row, text="🔑 Seedvis API Keys (1 key/dòng, tối đa 3):", font=("", 12)).pack(side="left")
+        self._seed_apikey_input = ctk.CTkTextbox(key_row, height=52, font=("Consolas", 10))
+        self._seed_apikey_input.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._seed_apikey_input.insert("1.0", self.settings.get("seedvis_api_key", ""))
+
+        api_row = ctk.CTkFrame(self._seedvis_block, fg_color="transparent")
+        api_row.pack(fill="x", padx=0, pady=(2, 6))
+        ctk.CTkLabel(api_row, text="Model:", font=("", 12)).pack(side="left")
         self._seed_model = ctk.CTkOptionMenu(api_row, values=["Veo-3.1"], width=110)
         self._seed_model.pack(side="left", padx=4)
         self._seed_model.set(self.settings.get("seedvis_model", "Veo-3.1"))
@@ -352,10 +552,38 @@ class SeedvisApp(ctk.CTk):
         self._seed_upscale.pack(side="left", padx=4)
         self._seed_upscale.set(self.settings.get("seedvis_upscale", "none"))
 
-        ctk.CTkLabel(api_row, text="Luồng:", font=("", 12)).pack(side="left", padx=(12, 0))
-        self._seed_threads = ctk.CTkEntry(api_row, width=50, font=("", 11))
-        self._seed_threads.pack(side="left", padx=4)
-        self._seed_threads.insert(0, self.settings.get("seedvis_threads", "12"))
+        # -- Khối cấu hình riêng cho NovaGateway --
+        self._nova_block = ctk.CTkFrame(api_card, fg_color="transparent")
+        nova_key_row = ctk.CTkFrame(self._nova_block, fg_color="transparent")
+        nova_key_row.pack(fill="x", padx=0, pady=(2, 2))
+        ctk.CTkLabel(nova_key_row, text="🔑 NovaGateway API Keys (1 key/dòng):", font=("", 12)).pack(side="left")
+        self._nova_apikey_input = ctk.CTkTextbox(nova_key_row, height=52, font=("Consolas", 10))
+        self._nova_apikey_input.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._nova_apikey_input.insert("1.0", self.settings.get("novagate_api_key", ""))
+
+        nova_opt_row = ctk.CTkFrame(self._nova_block, fg_color="transparent")
+        nova_opt_row.pack(fill="x", padx=0, pady=(2, 6))
+        ctk.CTkLabel(nova_opt_row, text="Model:", font=("", 12)).pack(side="left")
+        self._nova_model = ctk.CTkOptionMenu(nova_opt_row, values=["google/flow-veo"], width=210)
+        self._nova_model.pack(side="left", padx=4)
+        self._nova_model.set(self.settings.get("novagate_model", "google/flow-veo"))
+
+        ctk.CTkLabel(nova_opt_row, text="Độ phân giải:", font=("", 12)).pack(side="left", padx=(12, 0))
+        self._nova_resolution = ctk.CTkOptionMenu(nova_opt_row, values=["480p", "720p", "1080p"], width=90)
+        self._nova_resolution.pack(side="left", padx=4)
+        self._nova_resolution.set(self.settings.get("novagate_resolution", "480p"))
+
+        ctk.CTkLabel(nova_opt_row, text="Thời lượng clip (giây, 1-15):", font=("", 12)).pack(side="left", padx=(12, 0))
+        self._nova_duration = ctk.CTkEntry(nova_opt_row, width=50, font=("", 11))
+        self._nova_duration.pack(side="left", padx=4)
+        self._nova_duration.insert(0, self.settings.get("novagate_duration", "6"))
+
+        ctk.CTkLabel(nova_opt_row, text="Slot gói (luồng tạo):", font=("", 12)).pack(side="left", padx=(12, 0))
+        self._nova_slots = ctk.CTkEntry(nova_opt_row, width=40, font=("", 11))
+        self._nova_slots.pack(side="left", padx=4)
+        self._nova_slots.insert(0, self.settings.get("novagate_slots", "5"))
+
+        self._seed_on_provider_toggle()
 
         # --- Cài đặt Video ---
         cfg = ctk.CTkFrame(f, fg_color=CARD, corner_radius=10)
@@ -364,7 +592,7 @@ class SeedvisApp(ctk.CTk):
         row1 = ctk.CTkFrame(cfg, fg_color="transparent")
         row1.pack(fill="x", padx=12, pady=2)
         ctk.CTkLabel(row1, text="Tỉ lệ:", font=("", 12)).pack(side="left")
-        self._seed_aspect = ctk.CTkOptionMenu(row1, values=["Dọc 9:16 (TikTok)", "Ngang 16:9"], width=160)
+        self._seed_aspect = ctk.CTkOptionMenu(row1, values=["Dọc 9:16 (TikTok)", "Ngang 16:9", "Vuông 1:1"], width=160)
         self._seed_aspect.pack(side="left", padx=(4, 12))
         self._seed_aspect.set(self.settings.get("seedvis_aspect", "Dọc 9:16 (TikTok)"))
 
@@ -460,14 +688,60 @@ class SeedvisApp(ctk.CTk):
         self._seed_min_commission.pack(side="left", padx=4)
         self._seed_min_commission.insert(0, self.settings.get("seedvis_min_commission", "1"))
 
-        self._seed_btn_claim = ctk.CTkButton(claim_row, text="📥 Nhận SP", width=100, fg_color=AC, command=self._seed_claim_jobs)
-        self._seed_btn_claim.pack(side="left", padx=(12, 4))
-        self._seed_btn_release = ctk.CTkButton(claim_row, text="🔄 Giải phóng SP kẹt", width=150,
+        ctk.CTkLabel(claim_row, text="SL bán (tổng) từ:", font=("", 12)).pack(side="left", padx=(8, 0))
+        self._seed_min_sold = ctk.CTkEntry(claim_row, width=60, font=("", 11))
+        self._seed_min_sold.pack(side="left", padx=4)
+        self._seed_min_sold.insert(0, self.settings.get("seedvis_min_sold", "0"))
+
+        price_row = ctk.CTkFrame(claim_card, fg_color="transparent")
+        price_row.pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkLabel(price_row, text="Giá bán từ:", font=("", 12)).pack(side="left")
+        self._seed_min_price = ctk.CTkEntry(price_row, width=80, font=("", 11))
+        self._seed_min_price.pack(side="left", padx=4)
+        self._seed_min_price.insert(0, self.settings.get("seedvis_min_price", "0"))
+        ctk.CTkLabel(price_row, text="đến:", font=("", 12)).pack(side="left", padx=(8, 0))
+        self._seed_max_price = ctk.CTkEntry(price_row, width=80, font=("", 11))
+        self._seed_max_price.pack(side="left", padx=4)
+        self._seed_max_price.insert(0, self.settings.get("seedvis_max_price", ""))
+        ctk.CTkLabel(price_row, text="(để trống = không giới hạn giá trên)", font=("", 10), text_color=T2).pack(side="left", padx=(4, 0))
+
+        claim_btn_row = ctk.CTkFrame(claim_card, fg_color="transparent")
+        claim_btn_row.pack(fill="x", padx=12, pady=(0, 6))
+        self._seed_btn_claim = ctk.CTkButton(claim_btn_row, text="📥 Nhận SP", width=100, fg_color=AC, command=self._seed_claim_jobs)
+        self._seed_btn_claim.pack(side="left", padx=(0, 4))
+        self._seed_btn_release = ctk.CTkButton(claim_btn_row, text="🔄 Giải phóng SP kẹt", width=150,
                                               fg_color="#E53935", hover_color="#C62828", command=self._seed_release_jobs)
         self._seed_btn_release.pack(side="left", padx=4)
-        self._seed_btn_clear_violation = ctk.CTkButton(claim_row, text="🗑 Xóa Vi Phạm CS", width=150,
+        self._seed_btn_clear_violation = ctk.CTkButton(claim_btn_row, text="🗑 Xóa Vi Phạm CS", width=150,
                                                       fg_color="#E57373", hover_color="#C62828", command=self._seed_clear_violations)
         self._seed_btn_clear_violation.pack(side="left", padx=4)
+
+        # --- Tự động xin thêm SP khi hàng đợi sắp cạn (chạy 24/7 không lo hết job) ---
+        refill_row = ctk.CTkFrame(claim_card, fg_color="transparent")
+        refill_row.pack(fill="x", padx=12, pady=(0, 8))
+        self._seed_auto_refill = ctk.BooleanVar(value=self.settings.get("seedvis_auto_refill", False))
+        ctk.CTkCheckBox(refill_row, text="🔁 Tự động xin thêm SP khi hàng đợi còn dưới", variable=self._seed_auto_refill,
+                        font=("", 11), checkbox_width=18, checkbox_height=18).pack(side="left")
+        self._seed_auto_refill_threshold = ctk.CTkEntry(refill_row, width=60, font=("", 11))
+        self._seed_auto_refill_threshold.pack(side="left", padx=4)
+        self._seed_auto_refill_threshold.insert(0, self.settings.get("seedvis_auto_refill_threshold", "100"))
+        ctk.CTkLabel(refill_row, text="job → tự xin thêm", font=("", 11)).pack(side="left", padx=(4, 0))
+        self._seed_auto_refill_amount = ctk.CTkEntry(refill_row, width=70, font=("", 11))
+        self._seed_auto_refill_amount.pack(side="left", padx=4)
+        self._seed_auto_refill_amount.insert(0, self.settings.get("seedvis_auto_refill_amount", "1000"))
+        ctk.CTkLabel(refill_row, text="SP mỗi lần", font=("", 11)).pack(side="left")
+
+        # --- Giới hạn số video tối đa / ngày (Seedvis 880 video/ngày/key) ---
+        daily_row = ctk.CTkFrame(claim_card, fg_color="transparent")
+        daily_row.pack(fill="x", padx=12, pady=(0, 8))
+        self._seed_daily_limit_enabled = ctk.BooleanVar(value=self.settings.get("seedvis_daily_limit_enabled", True))
+        ctk.CTkCheckBox(daily_row, text="🛑 Giới hạn:", variable=self._seed_daily_limit_enabled,
+                        font=("", 11, "bold"), checkbox_width=18, checkbox_height=18).pack(side="left")
+        self._seed_daily_limit_entry = ctk.CTkEntry(daily_row, width=65, font=("", 11))
+        self._seed_daily_limit_entry.pack(side="left", padx=4)
+        self._seed_daily_limit_entry.insert(0, str(self.settings.get("seedvis_daily_limit", "880")))
+        ctk.CTkLabel(daily_row, text="video/ngày (Đủ số lượng hoặc hết credit sẽ tự dừng & trả SP kẹt)",
+                     font=("", 11), text_color=T2).pack(side="left", padx=(4, 0))
 
         # --- Bottom: Progress + Buttons ---
         bottom = ctk.CTkFrame(f, fg_color="transparent")
@@ -566,6 +840,16 @@ class SeedvisApp(ctk.CTk):
             else:
                 self._seed_ai_prompt.set("Prompt A + B")
 
+    def _seed_on_provider_toggle(self):
+        """Ẩn/hiện khối cấu hình đúng theo nhà cung cấp video đang chọn."""
+        is_nova = self._seed_provider.get().startswith("NovaGateway")
+        if is_nova:
+            self._seedvis_block.pack_forget()
+            self._nova_block.pack(fill="x", padx=12, pady=(0, 4))
+        else:
+            self._nova_block.pack_forget()
+            self._seedvis_block.pack(fill="x", padx=12, pady=(0, 4))
+
     def _seed_pick_dir(self):
         d = filedialog.askdirectory()
         if d:
@@ -585,6 +869,41 @@ class SeedvisApp(ctk.CTk):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _seed_report_job_status(self, item_id, status, extra=None, retries=3):
+        """Báo trạng thái SP về Server, có thử lại khi lỗi mạng.
+        Tránh trường hợp video đã xử lý xong nhưng Server không biết → SP kẹt ở 'processing' oan uổng."""
+        payload = {"itemId": item_id, "status": status, "tool": "seedvis"}
+        if extra:
+            payload.update(extra)
+        last_err = None
+        for attempt in range(retries):
+            try:
+                self._seed_api_call("POST", "/api/thinaptm/complete-job", payload)
+                return True
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    time.sleep(3 * (attempt + 1))
+        self._seed_log_msg(
+            f"  ⚠ Không báo được trạng thái '{status}' cho SP {item_id} về Server sau {retries} lần: {last_err}. "
+            f"SP có thể bị kẹt ở 'processing' → dùng '🔄 Giải phóng SP kẹt' nếu cần.")
+        return False
+
+    def _seed_release_single_job(self, item_id):
+        """Trả 1 sản phẩm về trạng thái pending trên Database Shopee khi lỗi mạng/server (tránh báo failed oan)."""
+        if not item_id:
+            return False
+        try:
+            r = self._seed_api_call("POST", "/api/thinaptm/release-single-job", {"itemId": str(item_id)})
+            return r.get("success", False) if isinstance(r, dict) else False
+        except Exception:
+            return False
+
+
+    def _seed_inflight_add(self, delta):
+        with self._seed_inflight_lock:
+            self._seed_inflight = max(0, self._seed_inflight + delta)
+
     def _seed_log_msg(self, msg):
         self._seed_log_buffer.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
         if not self._seed_log_flush_scheduled:
@@ -601,6 +920,8 @@ class SeedvisApp(ctk.CTk):
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 for m in batch:
                     f.write(f"{m}\n")
+            if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                self._seed_trim_log_file()
         except Exception:
             pass
         try:
@@ -614,25 +935,49 @@ class SeedvisApp(ctk.CTk):
         except Exception:
             pass
 
-    def _seed_download_image(self, image_url, save_path):
+    def _seed_trim_log_file(self):
+        """Cắt bớt log.txt khi vượt LOG_MAX_BYTES, chỉ giữ lại LOG_TRIM_KEEP_BYTES gần nhất."""
         try:
-            req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                with open(save_path, "wb") as wf:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk: break
-                        wf.write(chunk)
-            if os.path.exists(save_path) and os.path.getsize(save_path) == 0:
-                os.remove(save_path)
-                return False
-            return True
-        except Exception as e:
-            if os.path.exists(save_path):
-                try: os.remove(save_path)
-                except: pass
-            self._seed_log_msg(f"⚠ Tải ảnh lỗi: {e}")
-            return False
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_TRIM_KEEP_BYTES, os.SEEK_END)
+                tail = f.read()
+            # Cắt tại ranh giới dòng (byte 0x0A không bao giờ nằm giữa 1 ký tự UTF-8 nhiều byte → an toàn)
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]
+            with open(LOG_FILE, "wb") as f:
+                f.write(f"--- LOG ĐÃ ĐƯỢC CẮT BỚT (giữ {LOG_TRIM_KEEP_BYTES // 1024 // 1024}MB gần nhất) lúc {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode("utf-8"))
+                f.write(tail)
+        except Exception:
+            pass
+
+    def _seed_download_image(self, image_url, save_path, retries=3):
+        """Tải ảnh sản phẩm, thử lại khi mạng trục trặc để không mất SP oan vì lỗi tạm thời."""
+        last_err = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    with open(save_path, "wb") as wf:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk: break
+                            wf.write(chunk)
+                if os.path.exists(save_path) and os.path.getsize(save_path) == 0:
+                    os.remove(save_path)
+                    last_err = "File ảnh rỗng"
+                else:
+                    return True
+            except Exception as e:
+                last_err = e
+                if os.path.exists(save_path):
+                    try: os.remove(save_path)
+                    except: pass
+            if attempt < retries - 1:
+                self._seed_log_msg(f"⚠ Tải ảnh lỗi (thử {attempt+1}/{retries}): {last_err} → thử lại...")
+                time.sleep(3 * (attempt + 1))
+        self._seed_log_msg(f"❌ Tải ảnh lỗi sau {retries} lần: {last_err}")
+        return False
 
     def _seed_update_line_status(self, line_idx, status):
         prefix_map = {"success": "✅ ", "error": "❌ ", "running": "⏳ ", "violation": "⚠️ vi phạm cs "}
@@ -682,17 +1027,28 @@ class SeedvisApp(ctk.CTk):
             min_commission = float(min_comm_str.replace("%", "").strip() or "1.0")
         except:
             min_commission = 1.0
+        min_sold = parse_count(self._seed_min_sold.get().strip())
+        min_price = parse_price(self._seed_min_price.get().strip(), default=0.0)
+        _max_price_str = self._seed_max_price.get().strip()
+        max_price = parse_price(_max_price_str, default=None) if _max_price_str else None
 
         self._seed_btn_claim.configure(state="disabled", text="⏳...")
         self._seed_log_msg(f"📥 Đang xin {limit} SP từ Server (market={market})...")
 
         def _do():
             try:
-                result = self._seed_api_call("POST", "/api/thinaptm/claim-jobs", {
+                payload = {
                     "market": market, "clientId": client_id, "limit": limit, "sortBy": sort_by,
+                    "tool": "seedvis",
                     "min_item_id": min_item_id, "min_commission": min_commission,
-                    "minItemId": min_item_id, "minCommission": min_commission
-                })
+                    "minItemId": min_item_id, "minCommission": min_commission,
+                    "min_sold": min_sold, "minSold": min_sold,
+                    "min_price": min_price, "minPrice": min_price,
+                }
+                if max_price is not None:
+                    payload["max_price"] = max_price
+                    payload["maxPrice"] = max_price
+                result = self._seed_api_call("POST", "/api/thinaptm/claim-jobs", payload)
                 raw = result.get("products", [])
                 products = []
                 for p in raw:
@@ -706,7 +1062,12 @@ class SeedvisApp(ctk.CTk):
                         p["commission_rate"] = comm
                     except:
                         comm = 0.0
-                    if (min_item_id > 0 and iid < min_item_id) or comm < min_commission:
+                    sold_val = parse_count(p.get("sold", 0))
+                    price_val = parse_price(p.get("price", 0))
+                    # Lọc lại ở client vì Server có thể chưa hỗ trợ tham số min_sold/min_price/max_price
+                    if (min_item_id > 0 and iid < min_item_id) or comm < min_commission \
+                            or sold_val < min_sold or price_val < min_price \
+                            or (max_price is not None and price_val > max_price):
                         continue
                     products.append(p)
                 self._seed_claimed_products = products
@@ -729,7 +1090,7 @@ class SeedvisApp(ctk.CTk):
                     self._seed_list_count.configure(text=f"{count} SP")
                     self._seed_btn_claim.configure(state="normal", text="📥 Nhận SP")
                 self.after(0, _ui)
-                self._seed_log_msg(f"✅ Đã nhận {count} SP! Bấm ▶ để tạo video qua Seedvis.")
+                self._seed_log_msg(f"✅ Đã nhận {count} SP! Bấm ▶ để tạo video qua {APP_NAME}.")
             except Exception as e:
                 self._seed_log_msg(f"❌ Lỗi nhận SP: {e}")
                 self.after(0, lambda: self._seed_btn_claim.configure(state="normal", text="📥 Nhận SP"))
@@ -750,14 +1111,8 @@ class SeedvisApp(ctk.CTk):
         def _do():
             try:
                 r1 = self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
-                released1 = r1.get("released", 0) if isinstance(r1, dict) else 0
-                try:
-                    r2 = self._seed_api_call("POST", "/api/thinaptm/auto-release-stuck", {"hours": 2})
-                    released2 = r2.get("released", 0) if isinstance(r2, dict) else 0
-                except Exception:
-                    released2 = 0
-                total_released = released1 + released2
-                self._seed_log_msg(f"✅ Đã giải phóng {total_released} SP kẹt (Client: {released1}, Kẹt >2h: {released2})")
+                total_released = r1.get("released", 0) if isinstance(r1, dict) else 0
+                self._seed_log_msg(f"✅ Đã giải phóng {total_released} SP kẹt của client '{client_id}'")
                 self._seed_claimed_products = []
                 self._seed_video_done_count = 0
 
@@ -803,8 +1158,24 @@ class SeedvisApp(ctk.CTk):
             self._seed_log_msg("ℹ Không có SP vi phạm CS nào để xóa.")
 
     def _seed_stop(self):
-        self._seed_stop_flag = True
-        self._seed_log_msg("⏹ Đang dừng tạo video Seedvis...")
+        """Dừng lần 1: ngừng nhận việc mới nhưng để các job đã gửi (đã bị trừ phí, KHÔNG hủy được
+        trên server) render xong và tải video về. Bỏ ngang sẽ thành job 'mồ côi' chiếm slot tài khoản.
+        Dừng lần 2: bỏ ngay."""
+        if not self._seed_stop_flag:
+            self._seed_stop_flag = True
+            n = self._seed_inflight
+            if n > 0:
+                self._seed_log_msg(f"⏹ Dừng nhận việc mới. Đang chờ {n} job đã gửi (đã trừ phí) render xong "
+                                   f"và tải video về rồi mới dừng hẳn. Bấm ⏹ lần nữa để dừng NGAY.")
+                try:
+                    self._seed_btn_stop.configure(text="⏹ Dừng ngay")
+                except Exception:
+                    pass
+            else:
+                self._seed_log_msg(f"⏹ Đang dừng tạo video {APP_NAME}...")
+        elif not self._seed_force_stop:
+            self._seed_force_stop = True
+            self._seed_log_msg(f"⏹ DỪNG NGAY: bỏ {self._seed_inflight} job đang render (chúng vẫn chạy trên server và đã bị trừ phí).")
 
     def _seed_update_speed_label(self):
         """Cập nhật '⚡ X.X video/phút'."""
@@ -827,7 +1198,7 @@ class SeedvisApp(ctk.CTk):
     def _seed_finish(self):
         self._seed_running = False
         self.after(0, lambda: self._seed_btn_start.configure(state="normal"))
-        self.after(0, lambda: self._seed_btn_stop.configure(state="disabled"))
+        self.after(0, lambda: self._seed_btn_stop.configure(state="disabled", text="⏹ Dừng"))
         self.after(0, lambda: self._seed_btn_claim.configure(state="normal", text="📥 Nhận SP"))
 
     def _seed_start(self):
@@ -843,17 +1214,26 @@ class SeedvisApp(ctk.CTk):
         if not out_dir:
             messagebox.showwarning("Thiếu", "Hãy chọn thư mục lưu video.")
             return
-        api_key = self._seed_apikey_input.get().strip()
-        if not api_key:
-            messagebox.showerror("Thiếu API Key", "Vui lòng nhập Seedvis API Key.")
-            return
+        is_nova = self._seed_provider.get().startswith("NovaGateway")
+        if is_nova:
+            _raw_keys = self._nova_apikey_input.get("1.0", "end").strip()
+            api_keys = [k.strip() for k in _raw_keys.splitlines() if k.strip()]
+            if not api_keys:
+                messagebox.showerror("Thiếu API Key", "Vui lòng nhập ít nhất 1 NovaGateway API Key.")
+                return
+        else:
+            _raw_keys = self._seed_apikey_input.get("1.0", "end").strip()
+            api_keys = [k.strip() for k in _raw_keys.splitlines() if k.strip()]
+            if not api_keys:
+                messagebox.showerror("Thiếu API Key", "Vui lòng nhập ít nhất 1 Seedvis API Key.")
+                return
 
         self._seed_cached_url = self._seed_url.get().strip()
         if self._seed_cached_url and not (self._seed_cached_url.startswith("http://") or self._seed_cached_url.startswith("https://")):
             self._seed_cached_url = "http://" + self._seed_cached_url
         self._seed_cached_apikey = self._seed_apikey.get().strip()
 
-        self._seed_start_work(api_key)
+        self._seed_start_work(api_keys)
 
     def _run_ghep_anh_12s(self, video_path, image_path, output_path):
         """Ghép ảnh vào video tạo ra video 12s."""
@@ -1108,10 +1488,13 @@ class SeedvisApp(ctk.CTk):
 
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            cmd.extend(["-threads", "2"])
+            # Giới hạn luồng bộ lọc (đặt TRƯỚC file output, nếu đặt sau FFmpeg sẽ bỏ qua)
+            cmd[1:1] = ["-filter_threads", "1", "-filter_complex_threads", "1"]
             self._ffmpeg_sem.acquire()
             try:
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, startupinfo=startupinfo, timeout=120, creationflags=0x08000000)
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+                               startupinfo=startupinfo, timeout=120,
+                               creationflags=0x08000000 | 0x4000)  # NO_WINDOW | BELOW_NORMAL_PRIORITY
                 return True, ""
             except subprocess.TimeoutExpired:
                 return False, "FFmpeg timed out after 120s"
@@ -1121,9 +1504,6 @@ class SeedvisApp(ctk.CTk):
             finally:
                 self._ffmpeg_sem.release()
         except Exception as ex:
-            if hasattr(self, '_ffmpeg_sem'):
-                try: self._ffmpeg_sem.release()
-                except: pass
             return False, str(ex)
 
     def _seed_open_ai_keys_dialog(self):
@@ -1545,8 +1925,17 @@ class SeedvisApp(ctk.CTk):
                 if res: return res
         return None
 
-    def _seed_start_work(self, api_key):
+    def _seed_start_work(self, api_keys):
         """Worker chính xử lý tạo video qua Seedvis API (Veo 3.1)."""
+        # Round-robin Seedvis API keys
+        self._sv_key_lock = threading.Lock()
+        self._sv_key_idx = 0
+        def _next_sv_key():
+            with self._sv_key_lock:
+                key = api_keys[self._sv_key_idx % len(api_keys)]
+                self._sv_key_idx += 1
+            return key
+        api_key = api_keys[0]  # default for backward compat
         out_dir = self._seed_outdir.get().strip()
         products = list(self._seed_claimed_products)
         scene_choice = self._seed_scene.get()
@@ -1556,6 +1945,52 @@ class SeedvisApp(ctk.CTk):
         review_style = self._seed_review_style.get()
         del_img = self._seed_del_img.get()
         ghep_anh = self._seed_ghep_anh.get()
+
+        # Cấu hình tự động xin thêm SP khi hàng đợi sắp cạn (đọc trên main thread cho an toàn)
+        auto_refill = self._seed_auto_refill.get()
+        try:
+            auto_refill_threshold = max(0, int(self._seed_auto_refill_threshold.get().strip() or "100"))
+        except Exception:
+            auto_refill_threshold = 100
+        try:
+            auto_refill_amount = max(1, int(self._seed_auto_refill_amount.get().strip() or "1000"))
+        except Exception:
+            auto_refill_amount = 1000
+        sort_map = {"Số bán cao nhất": "sold", "Hoa hồng cao nhất": "commission"}
+        refill_sort_by = sort_map.get(self._seed_sort_by.get(), "sold")
+        refill_market = self._seed_market.get()
+        try:
+            refill_min_item_id = int(re.sub(r'\D', '', self._seed_min_item_id.get().strip()) or "40000000000")
+        except Exception:
+            refill_min_item_id = 40000000000
+        try:
+            refill_min_commission = float(self._seed_min_commission.get().strip().replace("%", "") or "1.0")
+        except Exception:
+            refill_min_commission = 1.0
+        refill_min_sold = parse_count(self._seed_min_sold.get().strip())
+        refill_min_price = parse_price(self._seed_min_price.get().strip(), default=0.0)
+        _rmax = self._seed_max_price.get().strip()
+        refill_max_price = parse_price(_rmax, default=None) if _rmax else None
+
+        # Nhà cung cấp video: Seedvis (Veo 3.1) hoặc NovaGateway (google/flow-veo)
+        video_provider = "nova" if self._seed_provider.get().startswith("NovaGateway") else "seedvis"
+        provider_label = "NovaGateway" if video_provider == "nova" else "Seedvis"
+        nova_model = self._nova_model.get().strip() or "google/flow-veo"
+        nova_resolution = self._nova_resolution.get().strip() or "480p"
+        try:
+            nova_seconds = max(1, min(15, int(self._nova_duration.get().strip() or "6")))
+        except Exception:
+            nova_seconds = 6
+        # Số job NovaGateway được render đồng thời theo gói (Studio = 5/tài khoản; 2 tài khoản thì đặt 10).
+        # Gửi vượt số này sẽ bị 429 → giữ hàng chờ ngay trong máy thay vì gửi lên để bị từ chối.
+        try:
+            nova_slots = max(1, min(64, int(self._nova_slots.get().strip() or "5")))
+        except Exception:
+            nova_slots = 5
+        nova_slot_sem = threading.Semaphore(nova_slots)
+        # Trạng thái "tạm ngưng gửi" dùng chung mọi luồng khi NovaGateway báo quá tải
+        nova_state = {"cooldown_until": 0.0, "busy_streak": 0, "probe_at": 0.0}
+        nova_state_lock = threading.Lock()
 
         if ai_mode == "Gemini" and not self.gemini_keys:
             messagebox.showwarning("Thiếu Key Gemini", "Vui lòng nạp API Key Gemini qua nút '🔑 AI Keys' hoặc kiểm tra settings.json.")
@@ -1581,16 +2016,23 @@ class SeedvisApp(ctk.CTk):
 
         aspect_local = self._seed_aspect.get()
         seed_aspect = "16:9" if "16:9" in aspect_local else "9:16"
+        # NovaGateway hỗ trợ thêm tỉ lệ vuông 1:1 (Seedvis không có nên seed_aspect giữ nguyên 2 lựa chọn cũ)
+        nova_aspect = "1:1" if "1:1" in aspect_local else ("16:9" if "16:9" in aspect_local else "9:16")
+        # Nhãn thời lượng để ghi log đúng nhà cung cấp (Seedvis "8s" cố định, Nova nhập tay 1-15s)
+        clip_duration_label = f"{nova_seconds}s" if video_provider == "nova" else clip_duration
 
         lang_val = self._seed_lang.get()
         lang_code = "vi" if "Việt" in lang_val else ("id" if "Indonesia" in lang_val else ("my" if "Malaysia" in lang_val else ("ph" if "Philippines" in lang_val else "en")))
 
         self._seed_running = True
         self._seed_stop_flag = False
+        self._seed_force_stop = False
+        with self._seed_inflight_lock:
+            self._seed_inflight = 0
         self._seed_btn_start.configure(state="disabled")
-        self._seed_btn_stop.configure(state="normal")
+        self._seed_btn_stop.configure(state="normal", text="⏹ Dừng")
         self._seed_btn_claim.configure(state="disabled")
-        self._seed_status_lbl.configure(text="⏳ Đang tạo video (Seedvis)...")
+        self._seed_status_lbl.configure(text=f"⏳ Đang tạo video ({provider_label})...")
 
         def work():
             total = len(products)
@@ -1598,9 +2040,49 @@ class SeedvisApp(ctk.CTk):
             os.makedirs(temp_dir, exist_ok=True)
             os.makedirs(out_dir, exist_ok=True)
 
-            seg_info = f"{n_segments_needed} segment × {clip_duration}" if n_segments_needed > 1 else f"{clip_duration}"
-            self._seed_log_msg(f"🌱 Seedvis — Model: {model_choice} | Video: {duration_sec}s ({seg_info}) | Tỉ lệ: {seed_aspect}")
-            self._seed_log_msg(f"🚀 Số luồng xử lý: {num_threads} luồng")
+            daily_limit_enabled = self._seed_daily_limit_enabled.get()
+            try:
+                daily_limit = int(self._seed_daily_limit_entry.get().strip() or "880")
+            except Exception:
+                daily_limit = 880
+
+            def count_today_videos(folder):
+                if not folder or not os.path.exists(folder):
+                    return 0
+                today_d = datetime.date.today()
+                c = 0
+                try:
+                    for entry in os.scandir(folder):
+                        if entry.is_file() and entry.name.lower().endswith(".mp4"):
+                            try:
+                                if datetime.date.fromtimestamp(entry.stat().st_mtime) == today_d:
+                                    c += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return c
+
+            if video_provider != "nova" and daily_limit_enabled and daily_limit > 0:
+                cur_today = count_today_videos(out_dir)
+                if cur_today >= daily_limit:
+                    self._seed_log_msg(f"\n{'='*50}")
+                    self._seed_log_msg(f"🛑 [Seedvis] Hôm nay đã hoàn thành {cur_today}/{daily_limit} video (đã đủ hạn mức {daily_limit} video/ngày).")
+                    self._seed_log_msg(f"🛑 Tự động giải phóng toàn bộ SP về Database Shopee để các máy khác làm...")
+                    try:
+                        self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
+                    except Exception:
+                        pass
+                    self._seed_finish()
+                    return
+
+            seg_info = f"{n_segments_needed} segment × {clip_duration_label}" if n_segments_needed > 1 else f"{clip_duration_label}"
+            if video_provider == "nova":
+                self._seed_log_msg(f"🌱 NovaGateway — Model: {nova_model} | Video: {duration_sec}s ({seg_info}) | Tỉ lệ: {nova_aspect} | {nova_resolution}")
+                self._seed_log_msg(f"🚀 Số luồng xử lý: {num_threads} luồng | Slot gói NovaGateway: {nova_slots} job render cùng lúc")
+            else:
+                self._seed_log_msg(f"🌱 Seedvis — Model: {model_choice} | Video: {duration_sec}s ({seg_info}) | Tỉ lệ: {seed_aspect}")
+                self._seed_log_msg(f"🚀 Số luồng xử lý: {num_threads} luồng")
             self._seed_log_msg(f"📋 {total} SP — Bắt đầu xử lý...")
 
             done_count = [0]
@@ -1608,9 +2090,6 @@ class SeedvisApp(ctk.CTk):
             self.after(0, lambda: self._seed_video_done_lbl.configure(text=""))
             self._seed_completion_times = collections.deque()
             self._seed_run_started_at = time.time()
-        # Xoa trang file log.txt khi khoi dong
-        with open("log.txt", "w", encoding="utf-8") as f:
-            f.write(f"--- PHIEN LAM VIEC MOI SEEDVIS ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
 
             self.after(0, lambda: self._seed_speed_lbl.configure(text="⚡ -- video/phút"))
             self.after(5000, self._seed_update_speed_label)
@@ -1621,11 +2100,93 @@ class SeedvisApp(ctk.CTk):
                 prod["_cycles"] = 0
                 jobq.put(prod)
 
+            if auto_refill:
+                self._seed_log_msg(f"🔁 Tự động xin thêm SP: BẬT (khi còn dưới {auto_refill_threshold} job → xin thêm {auto_refill_amount} SP)")
+
+            refill_state = {"in_progress": False, "next_allowed": 0.0}
+
+            def do_auto_refill():
+                """Xin thêm SP từ Server khi hàng đợi sắp cạn, để chạy 24/7 không bị hết job giữa chừng."""
+                nonlocal total
+                if refill_state["in_progress"] or self._seed_stop_flag:
+                    return
+                refill_state["in_progress"] = True
+                try:
+                    self._seed_log_msg(f"🔁 [Auto-Refill] Hàng đợi còn {jobq.qsize()} job (dưới {auto_refill_threshold}) → xin thêm {auto_refill_amount} SP...")
+                    try:
+                        _p = {
+                            "market": refill_market, "clientId": client_id, "limit": auto_refill_amount, "sortBy": refill_sort_by,
+                            "tool": "seedvis",
+                            "min_item_id": refill_min_item_id, "min_commission": refill_min_commission,
+                            "minItemId": refill_min_item_id, "minCommission": refill_min_commission,
+                            "min_sold": refill_min_sold, "minSold": refill_min_sold,
+                            "min_price": refill_min_price, "minPrice": refill_min_price,
+                        }
+                        if refill_max_price is not None:
+                            _p["max_price"] = refill_max_price
+                            _p["maxPrice"] = refill_max_price
+                        result = self._seed_api_call("POST", "/api/thinaptm/claim-jobs", _p)
+                    except Exception as e:
+                        self._seed_log_msg(f"  ⚠ [Auto-Refill] Lỗi xin thêm SP: {e}")
+                        refill_state["next_allowed"] = time.time() + 30
+                        return
+                    raw = result.get("products", []) if isinstance(result, dict) else []
+                    new_list = []
+                    for p in raw:
+                        try:
+                            iid = int(re.sub(r'\D', '', str(p.get("item_id", 0))))
+                        except Exception:
+                            iid = 0
+                        try:
+                            rc = float(p.get("commission_rate", 0) or 0)
+                            comm = rc * 100.0 if 0 < rc <= 1.0 else rc
+                            p["commission_rate"] = comm
+                        except Exception:
+                            comm = 0.0
+                        sold_val = parse_count(p.get("sold", 0))
+                        price_val = parse_price(p.get("price", 0))
+                        if (refill_min_item_id > 0 and iid < refill_min_item_id) or comm < refill_min_commission \
+                                or sold_val < refill_min_sold or price_val < refill_min_price \
+                                or (refill_max_price is not None and price_val > refill_max_price):
+                            continue
+                        new_list.append(p)
+                    if not new_list:
+                        self._seed_log_msg("  ℹ [Auto-Refill] Server chưa có SP mới phù hợp, sẽ thử lại sau 30s.")
+                        refill_state["next_allowed"] = time.time() + 30
+                        return
+                    start_idx = len(products)
+                    for j, p in enumerate(new_list):
+                        p["_idx"] = start_idx + j
+                        p["_cycles"] = 0
+                        products.append(p)
+                    total += len(new_list)
+                    for p in new_list:
+                        jobq.put(p)
+                    self._seed_claimed_products = list(products)
+
+                    def _ui_append(items=new_list):
+                        self._seed_products_text.configure(state="normal")
+                        sym = "₫" if refill_market == "VN" else ("Rp" if refill_market == "ID" else "₱")
+                        for p in items:
+                            name = (p.get('name', '') or '')[:55]
+                            iid = p.get('item_id', '?')
+                            try: pv = float(p.get('price', 0) or 0)
+                            except Exception: pv = 0.0
+                            sold = p.get('sold', 0)
+                            comm = float(p.get('commission_rate', 0) or 0)
+                            self._seed_products_text.insert("end", f"⏳ [{p['_idx']+1}] {iid} | {name} | {sym}{pv:,.0f} | Sold:{sold} | Comm:{comm:.1f}%\n")
+                        self._seed_list_count.configure(text=f"{len(products)} SP")
+                    self.after(0, _ui_append)
+                    self._seed_log_msg(f"  ✅ [Auto-Refill] Đã nhận thêm {len(new_list)} SP (tổng hàng đợi: {total})")
+                finally:
+                    refill_state["in_progress"] = False
+
             def submit_seedvis_job(prompt, b64_img, filename, image_url=None):
+                _cur_key = _next_sv_key()
                 endpoint = "https://seedvis.com/api/v1/developer/generations"
                 idem_key = str(uuid.uuid4())
                 headers = {
-                    "Authorization": f"Bearer {api_key}",
+                    "Authorization": f"Bearer {_cur_key}",
                     "Content-Type": "application/json",
                     "Idempotency-Key": idem_key,
                     "User-Agent": SEEDVIS_UA,
@@ -1648,55 +2209,75 @@ class SeedvisApp(ctk.CTk):
                     "upscale_video": upscale_choice
                 }
 
-                for attempt in range(5):
+                attempt = 0      # lỗi mạng/server: tối đa 5 lần
+                busy_tries = 0   # đầy slot / 429: tính riêng, chỉ là chờ tới lượt chứ không phải lỗi
+                while attempt < 5:
                     if self._seed_stop_flag: return "stopped", None
                     try:
                         req_data = json.dumps(payload).encode("utf-8")
                         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
                         with urllib.request.urlopen(req, timeout=60) as resp:
                             res_json = json.loads(resp.read().decode("utf-8"))
+                            if isinstance(res_json, dict):
+                                res_json["_key"] = _cur_key
                             return "ok", res_json
                     except urllib.error.HTTPError as he:
                         err_body = ""
                         try: err_body = he.read().decode("utf-8")
                         except Exception: pass
-                        err_str = err_body.lower()
-                        if he.code == 422 or any(k in err_str for k in ["policy", "violation", "filter", "safety", "nsfw"]):
-                            self._seed_log_msg(f"  ⚠️ Seedvis báo vi phạm: {err_body[:120]}")
-                            return "violation", err_body
+                        err_msg, err_fields, err_type = decode_api_error(err_body)
+                        err_str = err_msg.lower()
+                        # 1) Đầy slot tài khoản (422 "Đã đạt giới hạn..." hoặc 429) → chờ tới lượt, KHÔNG phải vi phạm
+                        if is_capacity_full(he.code, err_msg, err_fields) or he.code == 429:
+                            busy_tries += 1
+                            if busy_tries > 40:
+                                return "error", f"Seedvis đầy slot quá lâu: {err_msg[:120]}"
+                            if busy_tries == 1 or busy_tries % 5 == 0:
+                                self._seed_log_msg(f"  ⏸ Seedvis đầy slot ({busy_tries}/40) → chờ 20s: {err_msg[:130]}")
+                            for _ in range(20):
+                                if self._seed_stop_flag: return "stopped", None
+                                time.sleep(1)
+                            continue
+                        # 2) Vi phạm nội dung thật (phải có từ khóa chính sách trong thông báo)
+                        if is_policy_violation(err_msg):
+                            self._seed_log_msg(f"  ⚠️ Seedvis báo vi phạm: {err_msg[:150]}")
+                            return "violation", err_msg
                         if he.code == 401 or any(k in err_str for k in ["unauthorized", "invalid api key"]):
                             self._seed_log_msg(f"  ❌ Seedvis API Key không hợp lệ hoặc hết hạn!")
-                            return "invalid_key", err_body
-                        if he.code == 402:
-                            self._seed_log_msg(f"  💳 Seedvis báo hết credit (402): {err_body[:150]}")
-                            return "no_credit", err_body
-                        if he.code == 429 or "rate limit" in err_str:
-                            wait = min(20 * (attempt + 1), 60)
-                            self._seed_log_msg(f"  ⏳ Seedvis Rate limit (429) → chờ {wait}s...")
-                            time.sleep(wait)
-                            continue
-                        if he.code in (500, 502, 504):
-                            if attempt < 4:
-                                self._seed_log_msg(f"  ⚠️ Seedvis lỗi server {he.code} (thử {attempt+1}/5): {err_body[:150]}")
+                            return "invalid_key", err_msg
+                        if is_no_credit(he.code, err_msg, err_type):
+                            self._seed_log_msg(f"  💳 Seedvis báo hết credit ({he.code}): {err_msg[:150]}")
+                            return "no_credit", err_msg
+                        if he.code in (500, 502, 503, 504):
+                            attempt += 1
+                            if attempt < 5:
+                                self._seed_log_msg(f"  ⚠️ Seedvis lỗi server {he.code} (thử {attempt}/5): {err_msg[:150]}")
                                 time.sleep(4)
                                 continue
-                            return "error", f"HTTP {he.code}: {err_body[:120]}"
-                        self._seed_log_msg(f"  ❌ Seedvis lỗi HTTP {he.code} (không retry): {err_body[:150]}")
-                        return "error", f"HTTP {he.code}: {err_body[:120]}"
+                            return "error", f"HTTP {he.code}: {err_msg[:120]}"
+                        # 422 khác (sai tham số...) và mã còn lại: lỗi thường → thử lại SP sau, KHÔNG khóa SP
+                        self._seed_log_msg(f"  ❌ Seedvis lỗi HTTP {he.code}: {err_msg[:150]}")
+                        return "error", f"HTTP {he.code}: {err_msg[:120]}"
                     except Exception as ex:
-                        if attempt < 4:
-                            self._seed_log_msg(f"  ⚠️ Seedvis submit lỗi mạng (thử {attempt+1}/5): {ex}")
+                        attempt += 1
+                        if attempt < 5:
+                            self._seed_log_msg(f"  ⚠️ Seedvis submit lỗi mạng (thử {attempt}/5): {ex}")
                             time.sleep(4)
                             continue
                         return "error", str(ex)
                 return "error", "Max retries"
 
-            def poll_seedvis_job(job_id):
+            def poll_seedvis_job(job_id, key=None):
                 poll_url = f"https://seedvis.com/api/v1/developer/generations/{job_id}?wait=60"
-                headers = {"Authorization": f"Bearer {api_key}", "User-Agent": SEEDVIS_UA}
+                headers = {"Authorization": f"Bearer {key or api_key}", "User-Agent": SEEDVIS_UA}
                 start_ts = time.time()
-                while time.time() - start_ts < 600:
-                    if self._seed_stop_flag: return "stopped", None
+                last_note = start_ts
+                last_pos = None
+                # Tài khoản Seedvis: 10 lượt render đồng thời + 20 lượt chờ. Job xếp cuối hàng có thể mất >10 phút.
+                # Bỏ cuộc sớm rồi gửi job mới sẽ để lại job cũ "mồ côi" chiếm slot → đầy 30 slot → lỗi dây chuyền.
+                while time.time() - start_ts < 1800:
+                    # Chỉ bỏ khi "dừng ngay": job đã trừ phí & không hủy được trên server
+                    if self._seed_force_stop: return "stopped", None
                     try:
                         req = urllib.request.Request(poll_url, headers=headers, method="GET")
                         with urllib.request.urlopen(req, timeout=70) as resp:
@@ -1710,6 +2291,8 @@ class SeedvisApp(ctk.CTk):
                     job_data = data.get("data", {}) if isinstance(data, dict) else {}
                     is_final = job_data.get("is_final", False)
                     status = (job_data.get("status") or "").lower()
+                    queue_info = job_data.get("queue") or {}
+                    pos = queue_info.get("position") if isinstance(queue_info, dict) else None
 
                     if is_final:
                         if status in ("completed", "succeeded"):
@@ -1727,13 +2310,236 @@ class SeedvisApp(ctk.CTk):
                             msg = f"[{err_code}] {err_msg}" if err_code and err_msg else (err_msg or main_msg)
                             if msg.lstrip().startswith(")]}'"):
                                 msg = "Lỗi phiên nội bộ tạm thời của Seedvis (sẽ tự thử lại)"
-                            msg_lower = msg.lower()
-                            if any(k in msg_lower for k in ["policy", "violation", "filter", "safety"]):
+                            if is_policy_violation(msg):
                                 return "violation", msg
                             return "failed", msg
 
-                    time.sleep(6)
-                return "timeout", "Quá 10 phút chờ tạo video"
+                    waited_min = int((time.time() - start_ts) // 60)
+                    if status == "queued" and pos is not None and (last_pos is None or time.time() - last_note >= 300):
+                        eta = queue_info.get("estimated_start_seconds")
+                        eta_txt = f", dự kiến bắt đầu sau ~{max(1, int(eta) // 60)} phút" if isinstance(eta, (int, float)) else ""
+                        self._seed_log_msg(f"  📋 Job {job_id} đang xếp hàng Seedvis: vị trí {pos}{eta_txt} (đã chờ {waited_min} phút)")
+                        last_pos, last_note = pos, time.time()
+                    elif time.time() - last_note >= 300:
+                        last_note = time.time()
+                        self._seed_log_msg(f"  ⏳ Job {job_id} vẫn '{status or 'đang chờ'}' sau {waited_min} phút")
+                    # Seedvis gợi ý nhịp poll (next.after_seconds, vd 120s khi còn xếp hàng)
+                    nxt = job_data.get("next") or {}
+                    try:
+                        nap = int(nxt.get("after_seconds") or 6) if status == "queued" else 6
+                    except Exception:
+                        nap = 6
+                    for _ in range(max(6, min(nap, 60))):
+                        if self._seed_force_stop: return "stopped", None
+                        time.sleep(1)
+                return "timeout", "Quá 30 phút chờ tạo video"
+
+            # ── NovaGateway (google/flow-veo) ──────────────────────────────────────────────
+            NOVA_COOLDOWN_MAX = 600   # tạm ngưng tối đa 10 phút khi nghẽn kéo dài
+            NOVA_PROBE_EVERY = 120    # trong lúc tạm ngưng dài, cứ 2 phút cho ĐÚNG 1 luồng đi thăm dò
+
+            def nova_register_busy(reason):
+                """NovaGateway/Google Flow báo quá tải → mọi luồng tạm ngưng gửi job mới, thời gian tăng dần."""
+                now = time.time()
+                with nova_state_lock:
+                    nova_state["busy_streak"] += 1
+                    wait = min(15 * (2 ** (nova_state["busy_streak"] - 1)), NOVA_COOLDOWN_MAX)
+                    until = now + wait
+                    extended = until > nova_state["cooldown_until"]
+                    if extended:
+                        nova_state["cooldown_until"] = until
+                    nova_state["probe_at"] = max(nova_state["probe_at"], now + NOVA_PROBE_EVERY)
+                if extended:
+                    self._seed_log_msg(f"  🧊 NovaGateway quá tải → tạm ngưng gửi job mới {wait}s ({reason[:70]})")
+                return wait
+
+            def nova_register_ok():
+                """Có video thành công → server đã khỏe, bỏ tạm ngưng ngay cho mọi luồng."""
+                with nova_state_lock:
+                    nova_state["busy_streak"] = 0
+                    nova_state["cooldown_until"] = 0.0
+                    nova_state["probe_at"] = 0.0
+
+            def nova_wait_cooldown():
+                """True = được phép gửi. Trong lúc tạm ngưng dài, cho 1 luồng đi thăm dò mỗi
+                NOVA_PROBE_EVERY giây để phát hiện server hồi phục sớm (thay vì chờ hết 10 phút)."""
+                while True:
+                    if self._seed_stop_flag or self._seed_force_stop: return False
+                    now = time.time()
+                    with nova_state_lock:
+                        remain = nova_state["cooldown_until"] - now
+                        if remain <= 0:
+                            return True
+                        probe = remain > NOVA_PROBE_EVERY and now >= nova_state["probe_at"]
+                        if probe:
+                            nova_state["probe_at"] = now + NOVA_PROBE_EVERY
+                    if probe:
+                        self._seed_log_msg(f"  🔍 Gửi 1 job thăm dò xem NovaGateway hồi phục chưa (còn tạm ngưng {int(remain)}s)")
+                        return True
+                    time.sleep(min(1.0, remain))
+
+            def submit_nova_job(prompt, b64_img, image_url=None):
+                """Gửi job tạo video qua NovaGateway. Ưu tiên link ảnh https gốc để khỏi nhúng base64 nặng."""
+                _cur_key = _next_sv_key()
+                endpoint = "https://novagateway.net/v1/videos"
+                # Cloudflare (đứng trước NovaGateway) chặn request thiếu User-Agent giống trình duyệt,
+                # trả lỗi 403 "error code: 1010" trước khi tới được backend Nova.
+                headers = {"Authorization": f"Bearer {_cur_key}", "Content-Type": "application/json",
+                           "User-Agent": SEEDVIS_UA}
+                if image_url and str(image_url).startswith("http"):
+                    img_field = {"url": image_url}
+                else:
+                    img_field = {"url": f"data:image/jpeg;base64,{b64_img}"}
+                payload = {
+                    "model": nova_model,
+                    "prompt": prompt,
+                    "seconds": str(nova_seconds),
+                    "extra_body": {"resolution": nova_resolution, "aspect_ratio": nova_aspect},
+                    "image": img_field,
+                }
+                attempt = 0
+                busy_tries = 0
+                while attempt < 5:
+                    if self._seed_stop_flag: return "stopped", None
+                    try:
+                        req_data = json.dumps(payload).encode("utf-8")
+                        req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            if isinstance(res_json, dict):
+                                res_json["_key"] = _cur_key
+                            return "ok", res_json
+                    except urllib.error.HTTPError as he:
+                        err_body = ""
+                        try: err_body = he.read().decode("utf-8")
+                        except Exception: pass
+                        err_msg, err_fields, err_type = decode_api_error(err_body)
+                        err_str = err_msg.lower()
+                        # Xét quá tải TRƯỚC: thông báo 503 của Nova có câu "(Không mất Credits)" — nếu xét
+                        # hết-tiền trước sẽ khớp nhầm chữ "credits" và làm DỪNG toàn bộ hàng đợi.
+                        if he.code == 429 or is_capacity_full(he.code, err_msg, err_fields):
+                            busy_tries += 1
+                            if busy_tries > 20:
+                                return "error", f"HTTP {he.code} quá 20 lần: {err_msg[:120]}"
+                            nova_register_busy(f"HTTP {he.code}: {err_msg}")
+                            if not nova_wait_cooldown(): return "stopped", None
+                            continue
+                        if "content_policy" in err_str or is_policy_violation(err_msg):
+                            self._seed_log_msg(f"  ⚠️ NovaGateway báo vi phạm: {err_msg[:150]}")
+                            return "violation", err_msg
+                        if he.code == 401 or "unauthorized" in err_str:
+                            self._seed_log_msg(f"  ❌ NovaGateway API Key không hợp lệ hoặc hết hạn!")
+                            return "invalid_key", err_msg
+                        if is_no_credit(he.code, err_msg, err_type):
+                            self._seed_log_msg(f"  💳 NovaGateway báo hết credit ({he.code}): {err_msg[:150]}")
+                            return "no_credit", err_msg
+                        if he.code in (500, 502, 504):
+                            attempt += 1
+                            if attempt < 5:
+                                self._seed_log_msg(f"  ⚠️ NovaGateway lỗi server {he.code} (thử {attempt}/5): {err_msg[:150]}")
+                                time.sleep(4)
+                                continue
+                            return "error", f"HTTP {he.code}: {err_msg[:120]}"
+                        self._seed_log_msg(f"  ❌ NovaGateway lỗi HTTP {he.code}: {err_msg[:150]}")
+                        return "error", f"HTTP {he.code}: {err_msg[:120]}"
+                    except Exception as ex:
+                        attempt += 1
+                        if attempt < 5:
+                            self._seed_log_msg(f"  ⚠️ NovaGateway submit lỗi mạng (thử {attempt}/5): {ex}")
+                            time.sleep(4)
+                            continue
+                        return "error", str(ex)
+                return "error", "Max retries"
+
+            def poll_nova_job(job_id, key):
+                poll_url = f"https://novagateway.net/v1/videos/{job_id}"
+                headers = {"Authorization": f"Bearer {key}", "User-Agent": SEEDVIS_UA}
+                start_ts = time.time()
+                # Nova tự báo failed khi job quá 10 phút → chờ tới 15 phút để nhận đúng kết quả đó,
+                # thay vì tự bỏ cuộc sớm rồi gửi lại (job cũ thành mồ côi, tốn slot).
+                while time.time() - start_ts < 900:
+                    if self._seed_force_stop: return "stopped", None
+                    try:
+                        req = urllib.request.Request(poll_url, headers=headers, method="GET")
+                        with urllib.request.urlopen(req, timeout=70) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                    except Exception as e:
+                        if int(time.time() - start_ts) % 60 < 10:
+                            self._seed_log_msg(f"  ⚠️ NovaGateway poll lỗi (sẽ tự thử lại): {e}")
+                        time.sleep(10)
+                        continue
+
+                    status = (data.get("status") or "").lower()
+                    if status == "completed":
+                        vid_url = data.get("video_url") or data.get("url") or data.get("share_url")
+                        if vid_url:
+                            return "succeeded", vid_url
+                        return "error", "Job hoàn thành nhưng không có video url"
+                    elif status == "failed":
+                        err_obj = data.get("error") or {}
+                        err_code = err_obj.get("code", "") if isinstance(err_obj, dict) else ""
+                        err_msg = err_obj.get("message", "") if isinstance(err_obj, dict) else str(err_obj)
+                        msg = f"[{err_code}] {err_msg}" if err_code and err_msg else (err_msg or "failed")
+                        if err_code == "content_policy" or "content_policy" in msg.lower():
+                            return "violation", msg
+                        # Quá tải/tạm thời phía Nova hoặc Google Flow (Nova đã hoàn credit) → không phải lỗi của SP
+                        if err_code in NOVA_TRANSIENT_CODES or any(k in msg.lower() for k in NOVA_TRANSIENT_HINTS):
+                            return "busy", msg
+                        return "failed", msg
+
+                    time.sleep(10)  # Veo render mất 1-3 phút, poll dày hơn chỉ tăng nguy cơ 429
+                return "timeout", "Quá 15 phút chờ tạo video"
+
+            def submit_and_poll_segment(prompt, b64_img, image_url, item_id):
+                """Gộp submit+poll cho cả 2 nhà cung cấp → (status, video_url_or_err).
+                status: stopped/invalid_key/no_credit/violation/submit_error/succeeded/failed/timeout/busy/error"""
+                if video_provider == "nova":
+                    NOVA_SAME_SP_TRIES = 3
+                    res, data = "error", None
+                    for try_i in range(1, NOVA_SAME_SP_TRIES + 1):
+                        if not nova_wait_cooldown(): return "stopped", None
+                        if not nova_slot_sem.acquire(blocking=False):
+                            self._seed_log_msg(f"  ⏸ Đã đủ {nova_slots} job đang render → chờ slot NovaGateway trống...")
+                            while not nova_slot_sem.acquire(timeout=1):
+                                if self._seed_stop_flag: return "stopped", None
+                        try:
+                            sub_res, sub_data = submit_nova_job(prompt, b64_img, image_url=image_url)
+                            if sub_res == "stopped": return "stopped", None
+                            if sub_res in ("invalid_key", "no_credit", "violation"): return sub_res, sub_data
+                            if sub_res != "ok": return "submit_error", sub_data
+                            job_id = sub_data.get("id", "") if isinstance(sub_data, dict) else ""
+                            self._seed_log_msg(f"  ⏳ Job {job_id} đang render (NovaGateway)...")
+                            self._seed_inflight_add(1)
+                            try:
+                                res, data = poll_nova_job(job_id, sub_data.get("_key"))
+                            finally:
+                                self._seed_inflight_add(-1)
+                        finally:
+                            nova_slot_sem.release()
+                        if res == "busy":
+                            wait = nova_register_busy(str(data))
+                            if try_i < NOVA_SAME_SP_TRIES:
+                                self._seed_log_msg(f"  🔁 NovaGateway quá tải → thử lại chính SP này sau ~{wait}s (lần {try_i + 1}/{NOVA_SAME_SP_TRIES}): {str(data)[:90]}")
+                                continue
+                            return "busy", data
+                        if res == "succeeded":
+                            nova_register_ok()
+                        return res, data
+                    return res, data
+
+                sub_res, sub_data = submit_seedvis_job(prompt, b64_img, f"{item_id}.jpg", image_url=image_url)
+                if sub_res == "stopped": return "stopped", None
+                if sub_res in ("invalid_key", "no_credit", "violation"): return sub_res, sub_data
+                if sub_res != "ok": return "submit_error", sub_data
+
+                gen_data = sub_data.get("data", {}) if isinstance(sub_data, dict) else {}
+                job_id = gen_data.get("id", "")
+                self._seed_log_msg(f"  ⏳ Job {job_id} đã gửi, đang chờ Seedvis render...")
+                self._seed_inflight_add(1)
+                try:
+                    return poll_seedvis_job(job_id, sub_data.get("_key"))
+                finally:
+                    self._seed_inflight_add(-1)
 
             def process_one(prod):
                 idx = prod["_idx"]
@@ -1741,6 +2547,31 @@ class SeedvisApp(ctk.CTk):
                 item_id = prod.get("item_id", "")
                 product_name = prod.get("name", f"Product_{item_id}")
                 image_url = prod.get("image_url", "")
+
+                blocked = BLOCKED_IP_RE.search(product_name)
+                if blocked:
+                    self._seed_log_msg(f"\n📦 [{idx+1}/{total}] {product_name[:50]}")
+                    self._seed_log_msg(f"  🚫 Bỏ qua: nhân vật bản quyền ('{blocked.group(0)}')")
+                    prod["_status"] = "noretry"
+                    self._seed_report_job_status(item_id, "failed")
+                    self._seed_update_line_status(idx, "error")
+                    return ("fail", "Nhân vật bản quyền")
+
+                # PRE-RENDER DUPLICATE SHIELD: Tránh render trùng nếu SP đã có video trong out_dir của máy này
+                existing_vid = None
+                if out_dir and os.path.exists(out_dir):
+                    for c_fn in (f"{item_id}.mp4", f"{item_id}_12s.mp4"):
+                        cf = os.path.join(out_dir, c_fn)
+                        if os.path.exists(cf) and os.path.getsize(cf) > 10240:
+                            existing_vid = cf
+                            break
+
+                if existing_vid:
+                    self._seed_log_msg(f"  ⚡ SP {item_id} đã có video tại [{existing_vid}]! Tự động bỏ qua để tránh trùng.")
+                    prod["_status"] = "noretry"
+                    self._seed_report_job_status(item_id, "completed", extra={"video_path": os.path.basename(existing_vid)})
+                    self._seed_update_line_status(idx, "success")
+                    return ("ok", existing_vid)
 
                 self._seed_update_line_status(idx, "running")
                 self._seed_log_msg(f"\n{'='*50}")
@@ -1752,15 +2583,13 @@ class SeedvisApp(ctk.CTk):
                     if not image_url:
                         self._seed_log_msg(f"  ⚠ Không có image_url")
                         prod["_status"] = "noretry"
-                        try: self._seed_api_call("POST", "/api/thinaptm/complete-job", {"itemId": item_id, "status": "failed", "tool": "thinaptm"})
-                        except Exception: pass
+                        self._seed_report_job_status(item_id, "failed")
                         self._seed_update_line_status(idx, "error")
                         return ("fail", "Không có ảnh")
                     self._seed_log_msg(f"  📥 Tải ảnh: {image_url[:60]}...")
                     if not self._seed_download_image(image_url, img_path):
                         prod["_status"] = "noretry"
-                        try: self._seed_api_call("POST", "/api/thinaptm/complete-job", {"itemId": item_id, "status": "failed", "tool": "thinaptm"})
-                        except Exception: pass
+                        self._seed_report_job_status(item_id, "failed")
                         self._seed_update_line_status(idx, "error")
                         return ("fail", "Tải ảnh thất bại")
                     self._seed_log_msg(f"  ✅ Ảnh OK: {os.path.basename(img_path)}")
@@ -1780,7 +2609,7 @@ class SeedvisApp(ctk.CTk):
                     tvc_prompt, tvc_label = SV.build_tvc_prompt(product_name, lang=lang_code, review_style=review_style)
                     prompts = [tvc_prompt]
                     short_name = product_name[:80].strip()
-                    self._seed_log_msg(f"  📺 TVC {clip_duration}: 1 prompt ({tvc_label} - SP: {short_name[:40]}...)")
+                    self._seed_log_msg(f"  📺 TVC {clip_duration_label}: 1 prompt ({tvc_label} - SP: {short_name[:40]}...)")
                 else:
                     if ai_mode == "Gemini":
                         prompts = self._seed_ai_gen_prompts(
@@ -1804,7 +2633,7 @@ class SeedvisApp(ctk.CTk):
                             if ai_mode in ("Gemini", "Groq"):
                                 self._seed_log_msg(f"  ⚠ AI không phản hồi → dùng TVC fallback (SP: {short_name[:40]}...)")
                             else:
-                                self._seed_log_msg(f"  📺 TVC {clip_duration}: 1 prompt ({tvc_label} - SP: {short_name[:40]}...)")
+                                self._seed_log_msg(f"  📺 TVC {clip_duration_label}: 1 prompt ({tvc_label} - SP: {short_name[:40]}...)")
                         else:
                             prompts = SV.build_video_prompts_fallback(product_name, scene_en, duration_sec, lang=lang_code, review_style=review_style)
                             if ai_mode in ("Gemini", "Groq"):
@@ -1830,56 +2659,71 @@ class SeedvisApp(ctk.CTk):
                         if len(api_prompt) > 4900:
                             api_prompt = api_prompt[:4900]
 
-                    self._seed_log_msg(f"  🎬 Gửi tạo Segment {seg_idx+1}/{n_segments} ({clip_duration})...")
-                    sub_res, sub_data = submit_seedvis_job(api_prompt, b64_img, f"{item_id}.jpg", image_url=image_url)
-                    if sub_res == "stopped": return "retry_soft"
-                    if sub_res == "invalid_key":
+                    self._seed_log_msg(f"  🎬 Gửi tạo Segment {seg_idx+1}/{n_segments} ({clip_duration_label}, {provider_label})...")
+                    seg_res, seg_data = submit_and_poll_segment(api_prompt, b64_img, image_url, item_id)
+                    if seg_res == "stopped": return "retry_soft"
+                    if seg_res == "invalid_key":
                         prod["_status"] = "noretry"
                         self._seed_update_line_status(idx, "error")
-                        return ("fail", "Sai Seedvis API Key")
-                    if sub_res == "no_credit":
-                        prod["_status"] = "noretry"
-                        self._seed_update_line_status(idx, "error")
-                        self._seed_stop_flag = True
-                        self._seed_log_msg(f"  🛑 Hết credit Seedvis → dừng toàn bộ hàng đợi")
-                        return ("fail", "Hết credit Seedvis")
-                    if sub_res == "violation":
+                        return ("fail", f"Sai {provider_label} API Key")
+                    if seg_res == "no_credit":
+                        if video_provider != "nova":
+                            # Seedvis hết credit / chạm hạn mức 880 video/ngày: DỪNG NGAY và giải phóng SP kẹt
+                            self._seed_log_msg(f"\n{'='*50}")
+                            self._seed_log_msg(f"🛑 [Seedvis] API Key đã hết hạn mức credit (880 video/ngày)!")
+                            self._seed_log_msg(f"🛑 Tự động dừng phần mềm và giải phóng toàn bộ SP kẹt về Database Shopee...")
+                            self._seed_stop_flag = True
+                            self._seed_force_stop = True
+                            try:
+                                self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
+                            except Exception:
+                                pass
+                            return ("no_credit", "Hết credit Seedvis (880/ngày)")
+                        else:
+                            self._seed_log_msg(f"  ⚠️ {provider_label} báo hết credit/số dư (nghi lỗi tạm thời) → hoãn SP")
+                            nova_register_busy("báo hết credit (nghi lỗi tạm thời)")
+                            return "retry_busy"
+                    if seg_res == "violation":
                         prod["_status"] = "vi phạm cs"
-                        try: self._seed_api_call("POST", "/api/thinaptm/complete-job", {"itemId": item_id, "status": "vi phạm cs", "tool": "thinaptm"})
-                        except Exception: pass
+                        self._seed_report_job_status(item_id, "vi phạm cs")
                         self._seed_update_line_status(idx, "violation")
-                        return ("fail", "Vi phạm chính sách Seedvis")
-                    if sub_res != "ok":
-                        self._seed_log_msg(f"  ❌ Submit Segment {seg_idx+1} thất bại: {sub_data}")
+                        return ("fail", f"Vi phạm chính sách {provider_label}")
+                    if seg_res == "submit_error":
+                        self._seed_log_msg(f"  ❌ Submit Segment {seg_idx+1} thất bại: {seg_data}")
+                        return "retry_soft"
+                    if seg_res == "busy":
+                        # Quá tải phía nhà cung cấp, KHÔNG phải lỗi của SP → hoãn, không tính chu kỳ lỗi
+                        self._seed_log_msg(f"  ⏸ {provider_label} vẫn quá tải sau nhiều lần thử → hoãn SP, không tính lỗi")
+                        return "retry_busy"
+                    if seg_res != "succeeded":
+                        self._seed_log_msg(f"  ❌ Segment {seg_idx+1} thất bại: {seg_data}")
                         return "retry_soft"
 
-                    gen_data = sub_data.get("data", {}) if isinstance(sub_data, dict) else {}
-                    job_id = gen_data.get("id", "")
-                    self._seed_log_msg(f"  ⏳ Job {job_id[:16]}... Đang render...")
-
-                    poll_res, vid_url_or_err = poll_seedvis_job(job_id)
-                    if poll_res == "stopped": return "retry_soft"
-                    if poll_res == "violation":
-                        prod["_status"] = "vi phạm cs"
-                        try: self._seed_api_call("POST", "/api/thinaptm/complete-job", {"itemId": item_id, "status": "vi phạm cs", "tool": "thinaptm"})
-                        except Exception: pass
-                        self._seed_update_line_status(idx, "violation")
-                        return ("fail", f"Vi phạm CS: {vid_url_or_err}")
-                    if poll_res != "succeeded":
-                        self._seed_log_msg(f"  ❌ Segment {seg_idx+1} thất bại: {vid_url_or_err}")
-                        return "retry_soft"
-
-                    video_url = vid_url_or_err
+                    video_url = seg_data
                     self._seed_log_msg(f"  📥 Tải video segment {seg_idx+1}...")
-                    try:
-                        _dl_req = urllib.request.Request(video_url, headers={"User-Agent": SEEDVIS_UA})
-                        with urllib.request.urlopen(_dl_req, timeout=120) as _dl_resp, open(clip_path, "wb") as _dl_f:
-                            while True:
-                                chunk = _dl_resp.read(65536)
-                                if not chunk: break
-                                _dl_f.write(chunk)
-                    except Exception as de:
-                        self._seed_log_msg(f"  ❌ Tải video lỗi: {de}")
+                    # Video đã render xong (đã tốn thời gian/credit) → thử tải lại vài lần trước khi bỏ
+                    dl_err = None
+                    for dl_try in range(4):
+                        if self._seed_force_stop: return "retry_soft"
+                        try:
+                            _dl_req = urllib.request.Request(video_url, headers={"User-Agent": SEEDVIS_UA})
+                            with urllib.request.urlopen(_dl_req, timeout=120) as _dl_resp, open(clip_path, "wb") as _dl_f:
+                                while True:
+                                    chunk = _dl_resp.read(65536)
+                                    if not chunk: break
+                                    _dl_f.write(chunk)
+                            dl_err = None
+                            break
+                        except Exception as de:
+                            dl_err = de
+                            if dl_try < 3:
+                                self._seed_log_msg(f"  ⚠ Tải video lỗi (thử {dl_try+1}/4): {de} → tải lại...")
+                                time.sleep(3 * (dl_try + 1))
+                    if dl_err is not None:
+                        self._seed_log_msg(f"  ❌ Tải video lỗi sau 4 lần: {dl_err}")
+                        try:
+                            if os.path.exists(clip_path): os.remove(clip_path)
+                        except Exception: pass
                         return "retry_soft"
 
                     if os.path.exists(clip_path) and os.path.getsize(clip_path) > 10 * 1024:
@@ -1936,13 +2780,7 @@ class SeedvisApp(ctk.CTk):
                 except Exception as ex:
                     return ("fail", f"Lỗi di chuyển file: {ex}")
 
-                try:
-                    self._seed_api_call("POST", "/api/thinaptm/complete-job", {
-                        "itemId": item_id, "status": "completed", "tool": "thinaptm",
-                        "videoFile": os.path.basename(out_path)
-                    })
-                except Exception:
-                    pass
+                self._seed_report_job_status(item_id, "completed", {"videoFile": os.path.basename(out_path)})
 
                 if del_img:
                     try:
@@ -1958,46 +2796,93 @@ class SeedvisApp(ctk.CTk):
             def worker_thread():
                 while not self._seed_stop_flag:
                     try:
-                        prod = jobq.get_nowait()
+                        prod = jobq.get(timeout=1)
                     except queue.Empty:
+                        # Bật auto-refill → hàng đợi rỗng chỉ là tạm thời, chờ tiếp thay vì thoát luồng
+                        if auto_refill:
+                            continue
                         break
                     idx = prod["_idx"]
-                    res = process_one(prod)
-                    if isinstance(res, tuple) and res[0] == "ok":
-                        done_count[0] += 1
-                        self._seed_video_done_count = done_count[0]
-                        self._seed_completion_times.append(time.time())
-                        pct = done_count[0] / total
-                        self.after(0, lambda p=pct: self._seed_progress.set(p))
-                        self.after(0, lambda: self._seed_video_done_lbl.configure(text=f"✅ {done_count[0]}/{total} xong"))
-                    elif res == "retry_soft":
-                        prod["_cycles"] = prod.get("_cycles", 0) + 1
-                        if prod["_cycles"] < 3 and not self._seed_stop_flag:
-                            self._seed_log_msg(f"  🔄 Thử lại SP {prod.get('item_id')} (chu kỳ {prod['_cycles']}/3)...")
-                            jobq.put(prod)
+                    try:
+                        res = process_one(prod)
+                        if isinstance(res, tuple) and res[0] == "ok":
+                            done_count[0] += 1
+                            self._seed_video_done_count = done_count[0]
+                            self._seed_completion_times.append(time.time())
+                            pct = done_count[0] / total
+                            self.after(0, lambda p=pct: self._seed_progress.set(p))
+                            self.after(0, lambda: self._seed_video_done_lbl.configure(text=f"✅ {done_count[0]}/{total} xong"))
+
+                            # Kiểm tra hạn mức video/ngày của Seedvis (mặc định 880 video/ngày)
+                            if video_provider != "nova" and daily_limit_enabled and daily_limit > 0:
+                                today_video_cnt = count_today_videos(out_dir)
+                                if today_video_cnt >= daily_limit:
+                                    self._seed_log_msg(f"\n{'='*50}")
+                                    self._seed_log_msg(f"🛑 [Seedvis] ĐÃ ĐẠT HẠN MỨC {daily_limit} VIDEO/NGÀY HÔM NAY (Đã tạo {today_video_cnt} video).")
+                                    self._seed_log_msg(f"🛑 Tự động dừng phần mềm và giải phóng toàn bộ SP còn lại về Database Shopee...")
+                                    self._seed_stop_flag = True
+                                    self._seed_force_stop = True
+                                    try:
+                                        self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
+                                    except Exception:
+                                        pass
+                                    self.after(0, lambda c=today_video_cnt: self._seed_status_lbl.configure(
+                                        text=f"🛑 Đủ {c}/{daily_limit} video hôm nay - Đã dừng & giải phóng SP"
+                                    ))
+                        elif isinstance(res, tuple) and res[0] == "no_credit":
+                            self._seed_stop_flag = True
+                            self._seed_force_stop = True
+                            self._seed_update_line_status(idx, "error")
+                            self.after(0, lambda: self._seed_status_lbl.configure(
+                                text=f"🛑 Hết Credit ({APP_NAME}) - Đã dừng & giải phóng SP"
+                            ))
+                            break
+                        elif res == "retry_busy":
+                            # Nhà cung cấp quá tải: hoãn SP về cuối hàng đợi, KHÔNG tăng chu kỳ → không bị báo failed oan
+                            if not self._seed_stop_flag:
+                                jobq.put(prod)
+                            self._seed_update_line_status(idx, "running")
+                        elif res == "retry_soft":
+                            prod["_cycles"] = prod.get("_cycles", 0) + 1
+                            if prod["_cycles"] < 3 and not self._seed_stop_flag:
+                                self._seed_log_msg(f"  🔄 Thử lại SP {prod.get('item_id')} (chu kỳ {prod['_cycles']}/3)...")
+                                jobq.put(prod)
+                            else:
+                                error_count[0] += 1
+                                self._seed_update_line_status(idx, "error")
+                                if not self._seed_stop_flag:
+                                    self._seed_release_single_job(prod.get("item_id", ""))
+                                    self._seed_log_msg(f"  🔄 Đã trả SP {prod.get('item_id')} về pending sau 3 chu kỳ thử lỗi.")
                         else:
                             error_count[0] += 1
-                            self._seed_update_line_status(idx, "error")
-                    else:
+                    except Exception as ex:
                         error_count[0] += 1
-                    jobq.task_done()
+                        self._seed_log_msg(f"  ❌ Lỗi luồng xử lý SP {prod.get('item_id', '')}: {ex}")
+                        self._seed_update_line_status(idx, "error")
+                    finally:
+                        jobq.task_done()
             threads = []
             for _ in range(num_threads):
                 t = threading.Thread(target=worker_thread, daemon=True)
                 t.start()
                 threads.append(t)
 
-            while jobq.unfinished_tasks > 0:
+            while True:
                 if self._seed_stop_flag:
                     if all(not t.is_alive() for t in threads):
                         break
+                elif jobq.unfinished_tasks == 0 and not auto_refill:
+                    break  # Hết hàng đợi và không bật auto-refill → kết thúc như bình thường
+                elif auto_refill and not refill_state["in_progress"] and time.time() >= refill_state["next_allowed"] \
+                        and jobq.qsize() < auto_refill_threshold:
+                    threading.Thread(target=do_auto_refill, daemon=True).start()
                 time.sleep(0.5)
 
             for t in threads:
                 t.join(timeout=5)
 
             remaining = [p for p in products if p.get("_status") not in ("success", "noretry", "vi phạm cs")]
-            if remaining and self._seed_stop_flag:
+            if remaining:
                 self._seed_log_msg(f"🔄 Đang trả {len(remaining)} SP chưa xử lý về pending...")
                 try:
                     self._seed_api_call("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
@@ -2005,13 +2890,42 @@ class SeedvisApp(ctk.CTk):
                     self._seed_log_msg(f"  ⚠ Lỗi release-jobs: {e}")
 
             self._seed_log_msg(f"\n{'='*50}")
-            self._seed_log_msg(f"🏁 HOÀN TẤT SEEDVIS: ✅ {done_count[0]}/{total} thành công, ❌ {error_count[0]} lỗi")
+            self._seed_log_msg(f"🏁 HOÀN TẤT {APP_NAME.upper()}: ✅ {done_count[0]}/{total} thành công, ❌ {error_count[0]} lỗi")
             self.after(0, lambda: self._seed_status_lbl.configure(text=f"✅ {done_count[0]}/{total} xong"))
             self._seed_finish()
 
         threading.Thread(target=work, daemon=True).start()
 
 
+# Chống mở nhiều bản cùng lúc: các bản chạy song song dùng chung Client ID và temp_render,
+# dễ giẫm lên nhau và khi 1 bản thoát sẽ release-jobs giải phóng luôn SP bản kia đang xử lý.
+# Mỗi exe có khóa riêng → vẫn chạy được Seedvis và NovaGate cùng lúc.
+_SINGLE_INSTANCE_MUTEX_NAME = "NovaGateAppSingleInstanceMutex" if APP_MODE == "nova" else "SeedvisAppSingleInstanceMutex"
+ERROR_ALREADY_EXISTS = 183
+
+
+def _seed_acquire_single_instance_lock():
+    try:
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX_NAME)
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            return None
+        return mutex  # Giữ tham chiếu để mutex không bị giải phóng (tự mất khi tiến trình thoát)
+    except Exception:
+        return True  # Không phải Windows hoặc lỗi ctypes → bỏ qua khóa, không chặn chạy
+
+
 if __name__ == "__main__":
+    _single_instance_mutex = _seed_acquire_single_instance_lock()
+    if _single_instance_mutex is None:
+        try:
+            _tmp = tk.Tk()
+            _tmp.withdraw()
+            messagebox.showwarning(f"{APP_NAME} đang chạy",
+                                   f"Đã có một cửa sổ {APP_NAME} đang mở.\nVui lòng dùng cửa sổ đó thay vì mở thêm bản mới.")
+            _tmp.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
+
     app = SeedvisApp()
     app.mainloop()
