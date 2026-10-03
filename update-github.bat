@@ -3,7 +3,9 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title Push Code to GitHub (thincole/seedvis)
 
-:: Cau hinh Git user
+:: Cau hinh Git user & safe directory
+git config --global --add safe.directory "%~dp0" >nul 2>&1
+git config --global --add safe.directory * >nul 2>&1
 git config user.email "thincole@users.noreply.github.com"
 git config user.name "thincole"
 

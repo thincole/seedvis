@@ -15,6 +15,7 @@ E:\ThinAptm0707\0 - Seedvis\
 ├── shopeevideo.py           # Thư viện hỗ trợ: template prompt, FFmpeg, TTS, API Veo
 ├── run_seedvis.bat          # File chạy phần mềm (pythonw, ẩn CMD)
 ├── install.bat              # Bộ cài đặt tự động môi trường (Python, pip, FFmpeg)
+├── update.bat               # Cập nhật phiên bản mới nhất từ GitHub
 ├── update-github.bat        # Đẩy code lên GitHub (thincole/seedvis)
 ├── requirements.txt         # Danh sách 7 thư viện Python cần thiết
 ├── .gitignore               # Chặn push file nhạy cảm (settings, log, temp)
